@@ -19,7 +19,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 #[derive(Clone, Default)]
 pub struct FakeSystem {
     responses: Arc<Mutex<HashMap<String, Output>>>,
-    commands: Arc<Mutex<Vec<String>>>,
+    commands: Arc<Mutex<Vec<Command>>>,
     holds: Arc<Mutex<HashMap<String, Receiver<()>>>>,
 }
 
@@ -114,14 +114,28 @@ impl FakeSystem {
 
     /// Every command line brewmax has sent, in order.
     pub fn commands(&self) -> Vec<String> {
+        self.sent().iter().map(|c| c.to_string()).collect()
+    }
+
+    /// Every command brewmax has sent, with its environment.
+    pub fn sent(&self) -> Vec<Command> {
         self.commands.lock().unwrap().clone()
     }
 }
 
 impl System for FakeSystem {
+    /// Streams the scripted stdout line by line, then the scripted stderr.
+    fn stream(&self, command: &Command, on_line: &mut dyn FnMut(&str)) -> anyhow::Result<bool> {
+        let output = self.run(command)?;
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
+            on_line(line);
+        }
+        Ok(output.success)
+    }
+
     fn run(&self, command: &Command) -> anyhow::Result<Output> {
         let line = command.to_string();
-        self.commands.lock().unwrap().push(line.clone());
+        self.commands.lock().unwrap().push(command.clone());
         let hold = self.holds.lock().unwrap().remove(&line);
         if let Some(hold) = hold {
             let _ = hold.recv();
@@ -197,6 +211,9 @@ impl Harness {
 
     /// Move the selection to the row containing `name`.
     pub fn select(&mut self, name: &str) {
+        for _ in 0..50 {
+            self.press(KeyCode::Up);
+        }
         for _ in 0..50 {
             if self.detail_title_is(name) {
                 return;

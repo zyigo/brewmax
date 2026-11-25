@@ -33,7 +33,8 @@ pub fn refresh(system: &impl System) -> Refresh {
     }
 }
 
-fn load_outdated(system: &impl System) -> anyhow::Result<Outdated> {
+/// Read the outdated Packages from Homebrew's current metadata.
+pub fn load_outdated(system: &impl System) -> anyhow::Result<Outdated> {
     let output = system.run(&Command::brew(&["outdated", "--json=v2", "--greedy"]))?;
     if !output.success {
         anyhow::bail!("{}", output.stderr.trim());

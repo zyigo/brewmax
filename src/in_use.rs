@@ -13,8 +13,7 @@ use serde::Deserialize;
 use crate::inventory::{Kind, Package};
 use crate::system::{Command, System};
 
-/// The name brewmax is installed under; it is always In Use while running.
-const BREWMAX: &str = "brewmax";
+use crate::operation::BREWMAX;
 
 /// Why a Package is In Use.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

@@ -63,3 +63,52 @@ fn refreshes_and_reads_the_real_outdated_packages() {
         refresh.update_error
     );
 }
+
+#[test]
+fn streams_stdout_and_stderr_lines_from_a_real_process_with_its_environment() {
+    use brewmax::system::{Command, System};
+    let mut command = Command::new(
+        "/bin/sh",
+        &[
+            "-c",
+            "echo one; echo two >&2; echo \"env=$BREWMAX_TEST\"; exit 3",
+        ],
+    );
+    command.env.push(("BREWMAX_TEST".into(), "yes".into()));
+
+    let mut lines = Vec::new();
+    let success = MacSystem
+        .stream(&command, &mut |l| lines.push(l.to_string()))
+        .unwrap();
+
+    assert!(!success);
+    lines.sort();
+    assert_eq!(lines, vec!["env=yes", "one", "two"]);
+}
+
+#[test]
+#[ignore = "needs a real Homebrew installation with at least one outdated Formula"]
+fn plans_a_real_update_without_changing_anything() {
+    let packages = inventory::load_installed(&MacSystem).expect("brew info should parse");
+    let outdated =
+        brewmax::outdated::load_outdated(&MacSystem).expect("brew outdated should parse");
+    let Some(target) = packages
+        .iter()
+        .find(|p| p.kind == Kind::Formula && outdated.contains_key(&p.name))
+    else {
+        eprintln!("no outdated Formula to plan");
+        return;
+    };
+    let targets: Vec<_> = packages.iter().map(brewmax::in_use::Target::from).collect();
+
+    let (plan, held) =
+        brewmax::operation::plan(&MacSystem, target, &targets).expect("dry run should parse");
+
+    assert!(
+        plan.steps
+            .iter()
+            .any(|s| s.name == target.name && !s.to.is_empty()),
+        "{plan:#?}"
+    );
+    eprintln!("plan: {plan:#?}\nheld: {held:#?}");
+}
