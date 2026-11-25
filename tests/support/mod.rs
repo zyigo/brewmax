@@ -21,7 +21,11 @@ pub struct FakeSystem {
     responses: Arc<Mutex<HashMap<String, Output>>>,
     commands: Arc<Mutex<Vec<Command>>>,
     holds: Arc<Mutex<HashMap<String, Receiver<()>>>>,
+    effects: Arc<Mutex<HashMap<String, Effect>>>,
 }
+
+/// Something that happens to the fake machine when a command runs.
+type Effect = Arc<dyn Fn() + Send + Sync>;
 
 /// Lets a held command finish. Dropping it releases the command too.
 pub struct Release(Sender<()>);
@@ -104,6 +108,16 @@ impl FakeSystem {
         Release(tx)
     }
 
+    /// When `command_line` runs, also do `effect` (e.g. an app quits, so its
+    /// process disappears from `lsof`).
+    pub fn on_run(self, command_line: &str, effect: impl Fn() + Send + Sync + 'static) -> Self {
+        self.effects
+            .lock()
+            .unwrap()
+            .insert(command_line.to_string(), Arc::new(effect));
+        self
+    }
+
     /// How many times an exact command line has been sent.
     pub fn count(&self, command_line: &str) -> usize {
         self.commands()
@@ -139,6 +153,10 @@ impl System for FakeSystem {
         let hold = self.holds.lock().unwrap().remove(&line);
         if let Some(hold) = hold {
             let _ = hold.recv();
+        }
+        let effect = self.effects.lock().unwrap().get(&line).cloned();
+        if let Some(effect) = effect {
+            effect();
         }
         self.responses
             .lock()

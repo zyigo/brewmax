@@ -13,8 +13,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
 
 use crate::in_use::{self, InUse, Reason, Target};
+use crate::inventory::Kind;
 use crate::inventory::{self, Package};
-use crate::operation::{self, BREWMAX, Event, Held, Plan, TargetPlan};
+use crate::operation::{self, BREWMAX, Event, Held, Plan, QuitWait, TargetPlan};
 use crate::outdated::{self, Refresh};
 use crate::system::System;
 
@@ -148,6 +149,8 @@ pub struct App<S: System + Clone + Send + 'static> {
     scan_in_flight: Option<Receiver<anyhow::Result<InUse>>>,
 
     operation: Option<Operation>,
+    /// How long a Graceful Quit waits for an app to exit.
+    quit_wait: QuitWait,
     /// Packages marked (with space) to update together.
     marked: BTreeSet<String>,
     /// A short message for the user, shown in the footer until the next key.
@@ -177,8 +180,15 @@ impl<S: System + Clone + Send + 'static> App<S> {
             scan_in_flight: None,
             operation: None,
             marked: BTreeSet::new(),
+            quit_wait: QuitWait::default(),
             notice: None,
         }
+    }
+
+    /// Change how long a Graceful Quit waits for an app to exit, and how
+    /// often it checks.
+    pub fn set_quit_wait(&mut self, timeout: Duration, interval: Duration) {
+        self.quit_wait = QuitWait { timeout, interval };
     }
 
     pub fn should_quit(&self) -> bool {
@@ -392,6 +402,13 @@ impl<S: System + Clone + Send + 'static> App<S> {
                 .collect();
             operation.pre_held.push((target.target, target_held));
         }
+        for (target, held) in &operation.pre_held {
+            if open_app(held, target) {
+                operation.log.push(format!(
+                    "{target} is open: select it and press g to quit it gracefully and update"
+                ));
+            }
+        }
         if runnable.is_empty() {
             let all: Held = operation
                 .pre_held
@@ -409,6 +426,37 @@ impl<S: System + Clone + Send + 'static> App<S> {
         } else {
             self.execute();
         }
+    }
+
+    /// `g`: Graceful Quit the selected In Use Cask's apps, update it, and
+    /// reopen them.
+    fn graceful_quit(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(package) = self.selected_package().cloned() else {
+            return;
+        };
+        let app_open = self
+            .in_use
+            .get(&package.name)
+            .is_some_and(|reasons| reasons.iter().any(|r| matches!(r, Reason::App { .. })));
+        if package.kind != Kind::Cask || !app_open {
+            self.notice =
+                Some("Graceful Quit is for a Cask that is In Use (an open app)".to_string());
+            return;
+        }
+        let title = format!("Quit and update {}", package.name);
+        let system = self.system.clone();
+        let targets = self.targets();
+        let wait = self.quit_wait;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            operation::graceful_update(&system, &package, &targets, wait, &tx);
+        });
+        let mut operation = Operation::new(title, Stage::Running);
+        operation.events = Some(rx);
+        self.operation = Some(operation);
     }
 
     fn toggle_mark(&mut self) {
@@ -429,7 +477,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             let event = if block {
                 match rx.recv() {
                     Ok(event) => event,
-                    Err(_) => return self.operation_in_flight(),
+                    Err(_) => return self.worker_stopped(),
                 }
             } else {
                 match rx.try_recv() {
@@ -440,7 +488,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
                         }
                         return true;
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => return self.operation_in_flight(),
+                    Err(mpsc::TryRecvError::Disconnected) => return self.worker_stopped(),
                 }
             };
             self.apply(event);
@@ -452,6 +500,18 @@ impl<S: System + Clone + Send + 'static> App<S> {
                 return true;
             }
         }
+    }
+
+    /// The operation's background worker has stopped. If it stopped while
+    /// running (e.g. a Graceful Quit that ended Held), the run is over.
+    fn worker_stopped(&mut self) -> bool {
+        if let Some(operation) = &mut self.operation
+            && operation.events.is_none()
+            && matches!(operation.stage, Stage::Running)
+        {
+            operation.stage = Stage::Finished(std::mem::take(&mut operation.summary));
+        }
+        self.operation_in_flight()
     }
 
     fn operation_in_flight(&self) -> bool {
@@ -628,6 +688,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('u') => self.update(),
             KeyCode::Char('U') => self.update_all(),
+            KeyCode::Char('g') => self.graceful_quit(),
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('q') => match &self.operation {
                 Some(operation) if operation.busy() => {
@@ -923,7 +984,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             format!("  [filter: {}]", self.filter)
         };
         Paragraph::new(format!(
-            " ↑↓/jk move · Tab tab · space mark · u update · U update all · / filter · ? help · q quit{filter}"
+            " ↑↓/jk move · Tab tab · space mark · u update · U all · g quit & update · / filter · ? help · q quit{filter}"
         ))
     }
 }
@@ -931,7 +992,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
 fn render_help(frame: &mut Frame) {
     let area = frame.area();
     let width = 60.min(area.width);
-    let height = 16.min(area.height);
+    let height = 17.min(area.height);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -944,6 +1005,7 @@ fn render_help(frame: &mut Frame) {
         ("space", "Mark or unmark the selected Package"),
         ("u", "Update the marked Packages, or the selected one"),
         ("U", "Update all (not Pinned or Self-Updating)"),
+        ("g", "Quit an open app gracefully, update, reopen"),
         ("/", "Filter the list by name"),
         ("Enter", "Keep the filter, back to the list"),
         ("Esc", "Clear the filter"),
@@ -987,7 +1049,7 @@ fn summarise(reasons: &[Reason]) -> Vec<String> {
     let mut lines: Vec<(String, Vec<u32>)> = Vec::new();
     for reason in reasons {
         match reason {
-            Reason::Process { name, pid } => match lines
+            Reason::Process { name, pid } | Reason::App { name, pid } => match lines
                 .iter_mut()
                 .find(|(n, pids)| n == name && !pids.is_empty())
             {
@@ -1001,7 +1063,7 @@ fn summarise(reasons: &[Reason]) -> Vec<String> {
         .into_iter()
         .map(|(name, pids)| match pids.as_slice() {
             [] => name,
-            [pid] => Reason::Process { name, pid: *pid }.to_string(),
+            [pid] => format!("{name} (pid {pid})"),
             many => format!("{name} ({} processes)", many.len()),
         })
         .collect()
@@ -1115,4 +1177,11 @@ fn render_confirmation(frame: &mut Frame, operation: &Operation) {
             .block(Block::bordered().title(format!(" Confirm: {} ", operation.title))),
         popup,
     );
+}
+
+/// Is `target` held because one of its own apps is open (so `g` can help)?
+fn open_app(held: &Held, target: &str) -> bool {
+    held.iter().any(|(name, reasons)| {
+        name == target && reasons.iter().any(|r| matches!(r, Reason::App { .. }))
+    })
 }

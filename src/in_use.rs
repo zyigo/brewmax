@@ -20,6 +20,9 @@ use crate::operation::BREWMAX;
 pub enum Reason {
     /// A running process runs from, or has loaded a file from, the Package.
     Process { name: String, pid: u32 },
+    /// A process of one of the Cask's own apps is running: the app is open,
+    /// so a Graceful Quit can close it.
+    App { name: String, pid: u32 },
     /// The Formula is running as a `brew services` service.
     Service,
     /// The Package is brewmax itself.
@@ -29,7 +32,9 @@ pub enum Reason {
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Reason::Process { name, pid } => write!(f, "{name} (pid {pid})"),
+            Reason::Process { name, pid } | Reason::App { name, pid } => {
+                write!(f, "{name} (pid {pid})")
+            }
             Reason::Service => write!(f, "running as a brew service"),
             Reason::Brewmax => write!(f, "this is brewmax"),
         }
@@ -72,14 +77,11 @@ pub fn scan(system: &impl System, targets: &[Target]) -> anyhow::Result<InUse> {
     let lsof = system.run(&Command::new("lsof", &["-nP", "-F", "pcn", "-d", "txt"]))?;
     for (process, path) in process_files(&lsof.stdout) {
         for target in targets {
-            if uses(target, &path) {
-                add(
-                    &target.name,
-                    Reason::Process {
-                        name: process.name.clone(),
-                        pid: process.pid,
-                    },
-                );
+            let (name, pid) = (process.name.clone(), process.pid);
+            match uses(target, &path) {
+                Some(Use::App) => add(&target.name, Reason::App { name, pid }),
+                Some(Use::File) => add(&target.name, Reason::Process { name, pid }),
+                None => {}
             }
         }
     }
@@ -111,17 +113,24 @@ pub fn scan(system: &impl System, targets: &[Target]) -> anyhow::Result<InUse> {
     Ok(in_use)
 }
 
-/// Does a process file at `path` belong to `target`?
-fn uses(target: &Target, path: &str) -> bool {
+/// How a process file belongs to a Package.
+enum Use {
+    /// It is inside one of the Cask's apps.
+    App,
+    /// It is any other file of the Package.
+    File,
+}
+
+/// Does a process file at `path` belong to `target`, and how?
+fn uses(target: &Target, path: &str) -> Option<Use> {
     match target.kind {
-        Kind::Formula => path.contains(&format!("/Cellar/{}/", target.name)),
-        Kind::Cask => {
-            path.contains(&format!("/Caskroom/{}/", target.name))
-                || target.app_paths.iter().any(|app| {
-                    path.strip_prefix(app.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-                })
-        }
+        Kind::Formula => path
+            .contains(&format!("/Cellar/{}/", target.name))
+            .then_some(Use::File),
+        Kind::Cask if target.app_paths.iter().any(|app| inside(path, app)) => Some(Use::App),
+        Kind::Cask => path
+            .contains(&format!("/Caskroom/{}/", target.name))
+            .then_some(Use::File),
     }
 }
 
@@ -165,4 +174,22 @@ struct ServiceJson {
     name: String,
     #[serde(default)]
     status: String,
+}
+
+/// Which of `app_paths` (installed `.app` bundles) have a process running
+/// from inside them right now.
+pub fn running_apps(system: &impl System, app_paths: &[String]) -> anyhow::Result<Vec<String>> {
+    let lsof = system.run(&Command::new("lsof", &["-nP", "-F", "pcn", "-d", "txt"]))?;
+    let files = process_files(&lsof.stdout);
+    Ok(app_paths
+        .iter()
+        .filter(|app| files.iter().any(|(_, path)| inside(path, app)))
+        .cloned()
+        .collect())
+}
+
+/// Is `path` inside the directory `dir`?
+fn inside(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }

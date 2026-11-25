@@ -112,3 +112,21 @@ fn plans_a_real_update_without_changing_anything() {
     );
     eprintln!("plan: {plan:#?}\nheld: {held:#?}");
 }
+
+#[test]
+#[ignore = "needs a real Homebrew installation; reads, never quits"]
+fn finds_which_real_cask_apps_are_running() {
+    let packages = inventory::load_installed(&MacSystem).expect("brew info should parse");
+    let app_paths: Vec<String> = packages
+        .iter()
+        .filter(|p| p.kind == Kind::Cask)
+        .flat_map(|p| p.app_paths.clone())
+        .collect();
+
+    let running = brewmax::in_use::running_apps(&MacSystem, &app_paths).expect("lsof should run");
+
+    for app in &running {
+        assert!(app_paths.contains(app));
+    }
+    eprintln!("running Cask apps: {running:#?}");
+}

@@ -7,6 +7,7 @@
 //! output, and carrying on past a failure.
 
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use crate::in_use::{self, InUse, Reason, Target};
 use crate::inventory::{self, Kind, Package};
@@ -243,4 +244,177 @@ fn parse_steps(output: &str) -> Vec<Step> {
             })
         })
         .collect()
+}
+
+/// How long a Graceful Quit waits for an app to exit, and how often it checks.
+#[derive(Debug, Clone, Copy)]
+pub struct QuitWait {
+    pub timeout: Duration,
+    pub interval: Duration,
+}
+
+impl Default for QuitWait {
+    /// Long enough to answer a save prompt.
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Graceful Quit: ask each of the Cask's running apps to quit the normal way
+/// (so it can prompt to save), wait until it has exited, update the Cask as
+/// usual, then reopen the apps brewmax quit. Never force-kills: if an app
+/// refuses or doesn't exit in time, the Cask stays Held and unchanged.
+pub fn graceful_update(
+    system: &impl System,
+    package: &Package,
+    targets: &[Target],
+    wait: QuitWait,
+    events: &Sender<Event>,
+) {
+    let line = |text: String| {
+        let _ = events.send(Event::Line(text));
+    };
+    // What about the Cask is In Use now. A failed check is an error, never
+    // "nothing is In Use".
+    let held_now = || -> anyhow::Result<Held> {
+        let in_use = in_use::scan(system, targets)?;
+        Ok(in_use
+            .get(&package.name)
+            .map(|reasons| vec![(package.name.clone(), reasons.clone())])
+            .unwrap_or_default())
+    };
+    let last_known = || held_now().unwrap_or_default();
+    let hold = |held: Held| {
+        let _ = events.send(Event::StepHeld {
+            target: package.name.clone(),
+            held,
+        });
+    };
+
+    let apps = match in_use::running_apps(system, &package.app_paths) {
+        Ok(apps) if !apps.is_empty() => apps,
+        Ok(_) => {
+            line(format!(
+                "None of {}'s apps are running, so there is nothing to quit",
+                package.name
+            ));
+            hold(last_known());
+            return;
+        }
+        Err(e) => {
+            line(format!("Could not check which apps are running: {e:#}"));
+            hold(last_known());
+            return;
+        }
+    };
+
+    let mut quit = Vec::new();
+    for app in &apps {
+        let name = app_name(app);
+        let result = bundle_id(system, app).and_then(|id| {
+            line(format!("Asking {name} to quit…"));
+            let script = format!("tell application id \"{id}\" to quit");
+            let output = system.run(&Command::new("osascript", &["-e", &script]))?;
+            if output.success {
+                Ok(())
+            } else {
+                anyhow::bail!("{}", output.stderr.trim())
+            }
+        });
+        if let Err(e) = result {
+            line(format!("{name} did not quit, nothing was changed: {e:#}"));
+            hold(last_known());
+            reopen(system, &quit, &line);
+            return;
+        }
+        quit.push(app.clone());
+    }
+
+    let deadline = Instant::now() + wait.timeout;
+    let mut last_held = Held::new();
+    loop {
+        match held_now() {
+            Ok(held) if held.is_empty() => break,
+            Ok(held) => last_held = held,
+            // Can't tell whether the app has quit: keep waiting.
+            Err(e) => line(format!("In Use check failed, still waiting: {e:#}")),
+        }
+        if Instant::now() >= deadline {
+            line(format!(
+                "{} did not quit within {}s, nothing was changed",
+                package.name,
+                wait.timeout.as_secs_f32()
+            ));
+            if last_held.is_empty() {
+                last_held = vec![(package.name.clone(), Vec::new())];
+            }
+            hold(last_held);
+            // Reopen any app that did quit, so brewmax leaves nothing closed.
+            let still_running =
+                in_use::running_apps(system, &quit).unwrap_or_else(|_| quit.clone());
+            let exited: Vec<String> = quit
+                .iter()
+                .filter(|a| !still_running.contains(a))
+                .cloned()
+                .collect();
+            reopen(system, &exited, &line);
+            return;
+        }
+        std::thread::sleep(wait.interval);
+    }
+
+    match plan(system, std::slice::from_ref(package), targets) {
+        Err(error) => {
+            let _ = events.send(Event::StepFinished {
+                target: package.name.clone(),
+                success: false,
+                error: Some(error),
+            });
+        }
+        Ok((_, held)) if !held.is_empty() => hold(held),
+        Ok((plan, _)) => execute(system, &plan.targets, targets, events),
+    }
+    reopen(system, &quit, &line);
+}
+
+/// Reopen apps brewmax quit.
+fn reopen(system: &impl System, apps: &[String], line: &impl Fn(String)) {
+    for app in apps {
+        match system.run(&Command::new("open", &["-a", app])) {
+            Ok(output) if output.success => line(format!("Reopened {}", app_name(app))),
+            Ok(output) => line(format!(
+                "Could not reopen {}: {}",
+                app_name(app),
+                output.stderr.trim()
+            )),
+            Err(e) => line(format!("Could not reopen {}: {e:#}", app_name(app))),
+        }
+    }
+}
+
+/// "Slack" for "/Applications/Slack.app".
+fn app_name(app: &str) -> &str {
+    let file = app.rsplit('/').next().unwrap_or(app);
+    file.strip_suffix(".app").unwrap_or(file)
+}
+
+/// The app's bundle identifier. Quitting by identifier never makes macOS
+/// ask "where is this app?", unlike quitting by name.
+fn bundle_id(system: &impl System, app: &str) -> anyhow::Result<String> {
+    let plist = format!("{app}/Contents/Info.plist");
+    let output = system.run(&Command::new(
+        "/usr/libexec/PlistBuddy",
+        &["-c", "Print :CFBundleIdentifier", &plist],
+    ))?;
+    let id = output.stdout.trim();
+    if !output.success || id.is_empty() {
+        anyhow::bail!(
+            "could not read the bundle id of {app}: {}",
+            output.stderr.trim()
+        );
+    }
+    Ok(id.to_string())
 }
