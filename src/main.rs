@@ -5,7 +5,34 @@ use brewmax::system::MacSystem;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
+const USAGE: &str = "\
+Usage: brewmax [--version | --help]
+
+A terminal UI for managing Homebrew Packages without disrupting software
+that is In Use. Run with no arguments to start it; press ? inside for keys.
+
+Options:
+  -V, --version  Print the version and exit
+  -h, --help     Print this help and exit";
+
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        [] => {}
+        ["-V" | "--version"] => {
+            println!("brewmax {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        ["-h" | "--help"] => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        _ => {
+            eprintln!("brewmax: unexpected arguments: {}\n\n{USAGE}", args.join(" "));
+            std::process::exit(2);
+        }
+    }
+
     let app = App::new(MacSystem);
     // `ratatui::init` installs a panic hook that restores the terminal.
     let terminal = ratatui::init();

@@ -1,0 +1,52 @@
+# Cut a release when a version tag (v1.2.3) is pushed: test, build the
+# Apple silicon binary, and attach it to a GitHub Release with its SHA-256.
+# The Homebrew formula in zyigo/homebrew-tap is then updated with
+# scripts/update-tap.sh; see docs/releasing.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14 # Apple silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          name="brewmax-$VERSION-aarch64-apple-darwin"
+          mkdir -p dist
+          ./target/release/brewmax --version
+          tar -czf "dist/$name.tar.gz" -C target/release brewmax
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "brewmax $VERSION" \
+            --notes "Install with \`brew install zyigo/tap/brewmax\` (macOS, Apple silicon)."
