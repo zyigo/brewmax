@@ -25,6 +25,8 @@ pub struct Package {
     pub kind: Kind,
     pub version: String,
     pub desc: Option<String>,
+    /// For Casks: where their `.app` bundles are installed.
+    pub app_paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +55,30 @@ struct CaskJson {
     token: String,
     desc: Option<String>,
     installed: Option<String>,
+    #[serde(default)]
+    artifacts: Vec<serde_json::Value>,
+}
+
+/// The installed locations of a Cask's `.app` bundles. Homebrew records the
+/// installed path as `target`; older output only names the bundle, which
+/// lands in `/Applications`.
+fn app_paths(artifacts: &[serde_json::Value]) -> Vec<String> {
+    artifacts
+        .iter()
+        .filter_map(|artifact| {
+            let apps = artifact.get("app")?.as_array()?;
+            if let Some(target) = artifact.get("target").and_then(|t| t.as_str()) {
+                return Some(vec![target.to_string()]);
+            }
+            Some(
+                apps.iter()
+                    .filter_map(|a| a.as_str())
+                    .map(|a| format!("/Applications/{a}"))
+                    .collect(),
+            )
+        })
+        .flatten()
+        .collect()
 }
 
 /// Read every installed Package, sorted by name.
@@ -72,9 +98,11 @@ pub fn load_installed(system: &impl System) -> anyhow::Result<Vec<Package>> {
         name: f.name,
         kind: Kind::Formula,
         desc: f.desc,
+        app_paths: Vec::new(),
     });
     let casks = info.casks.into_iter().map(|c| Package {
         version: c.installed.unwrap_or_default(),
+        app_paths: app_paths(&c.artifacts),
         name: c.token,
         kind: Kind::Cask,
         desc: c.desc,

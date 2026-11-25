@@ -3,9 +3,9 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use brewmax::app::App;
 use brewmax::system::{Command, Output, System};
@@ -17,8 +17,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 /// every command brewmax sends it.
 #[derive(Clone, Default)]
 pub struct FakeSystem {
-    responses: Rc<RefCell<HashMap<String, Output>>>,
-    commands: Rc<RefCell<Vec<String>>>,
+    responses: Arc<Mutex<HashMap<String, Output>>>,
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeSystem {
@@ -28,7 +28,7 @@ impl FakeSystem {
 
     /// Script the stdout returned for an exact command line.
     pub fn on(self, command_line: &str, stdout: &str) -> Self {
-        self.responses.borrow_mut().insert(
+        self.responses.lock().unwrap().insert(
             command_line.to_string(),
             Output {
                 success: true,
@@ -41,7 +41,7 @@ impl FakeSystem {
 
     /// Script a failing exit with the given stderr for an exact command line.
     pub fn failing(self, command_line: &str, stderr: &str) -> Self {
-        self.responses.borrow_mut().insert(
+        self.responses.lock().unwrap().insert(
             command_line.to_string(),
             Output {
                 success: false,
@@ -52,18 +52,57 @@ impl FakeSystem {
         self
     }
 
+    /// Change the stdout scripted for a command line mid-test (e.g. an app quits).
+    pub fn set(&self, command_line: &str, stdout: &str) {
+        self.responses.lock().unwrap().insert(
+            command_line.to_string(),
+            Output {
+                success: true,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            },
+        );
+    }
+
+    /// Make a command line fail mid-test.
+    pub fn set_failing(&self, command_line: &str, stderr: &str) {
+        self.responses.lock().unwrap().insert(
+            command_line.to_string(),
+            Output {
+                success: false,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            },
+        );
+    }
+
+    /// Stop scripting a command line, so running it errors as if the program
+    /// were missing.
+    pub fn remove(&self, command_line: &str) {
+        self.responses.lock().unwrap().remove(command_line);
+    }
+
+    /// How many times an exact command line has been sent.
+    pub fn count(&self, command_line: &str) -> usize {
+        self.commands()
+            .iter()
+            .filter(|c| *c == command_line)
+            .count()
+    }
+
     /// Every command line brewmax has sent, in order.
     pub fn commands(&self) -> Vec<String> {
-        self.commands.borrow().clone()
+        self.commands.lock().unwrap().clone()
     }
 }
 
 impl System for FakeSystem {
     fn run(&self, command: &Command) -> anyhow::Result<Output> {
         let line = command.to_string();
-        self.commands.borrow_mut().push(line.clone());
+        self.commands.lock().unwrap().push(line.clone());
         self.responses
-            .borrow()
+            .lock()
+            .unwrap()
             .get(&line)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("fake system has no response scripted for `{line}`"))
@@ -93,6 +132,39 @@ impl Harness {
     pub fn press(&mut self, code: KeyCode) {
         self.app.handle_key(KeyEvent::from(code));
         self.render();
+    }
+
+    /// Advance the app's clock to `now`, wait for any In Use scan that tick
+    /// started to finish, and re-render.
+    pub fn tick_at(&mut self, now: Instant) {
+        self.app.tick(now);
+        self.app.wait_for_scan();
+        self.render();
+    }
+
+    /// Run one In Use scan to completion.
+    pub fn scan_in_use(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    /// Move the selection to the row containing `name`.
+    pub fn select(&mut self, name: &str) {
+        for _ in 0..50 {
+            if self.detail_title_is(name) {
+                return;
+            }
+            self.press(KeyCode::Down);
+        }
+        panic!("could not select {name}:\n{}", self.screen());
+    }
+
+    fn detail_title_is(&self, name: &str) -> bool {
+        // The detail pane's first content line is the selected Package's name.
+        self.screen()
+            .lines()
+            .nth(1)
+            .and_then(|l| l.rsplit('│').nth(1))
+            .is_some_and(|cell| cell.trim() == name)
     }
 
     fn render(&mut self) {

@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use brewmax::app::App;
 use brewmax::system::MacSystem;
 use ratatui::DefaultTerminal;
@@ -14,8 +16,11 @@ fn main() -> anyhow::Result<()> {
 
 fn run(mut terminal: DefaultTerminal, mut app: App<MacSystem>) -> anyhow::Result<()> {
     while !app.should_quit() {
+        app.tick(Instant::now());
         terminal.draw(|frame| app.render(frame))?;
-        if let Event::Key(key) = event::read()?
+        // Wake regularly so background results (In Use scans) get drawn.
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
             app.handle_key(key);

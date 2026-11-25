@@ -26,3 +26,21 @@ fn reads_the_real_installed_packages() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs a real Homebrew installation"]
+fn scans_the_real_machine_for_in_use_packages() {
+    let packages = inventory::load_installed(&MacSystem).expect("brew info should parse");
+    let targets: Vec<_> = packages.iter().map(brewmax::in_use::Target::from).collect();
+
+    let in_use =
+        brewmax::in_use::scan(&MacSystem, &targets).expect("lsof and brew services should run");
+
+    for name in in_use.keys() {
+        assert!(
+            packages.iter().any(|p| &p.name == name),
+            "{name} is not an installed package"
+        );
+    }
+    eprintln!("In Use on this machine: {in_use:#?}");
+}
