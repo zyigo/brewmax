@@ -258,14 +258,7 @@ pub fn plan_removal(
     action: Action,
     targets: &[Target],
 ) -> Result<(Plan, Held), String> {
-    let dependents = dependents(system, package)?;
-    if !dependents.is_empty() {
-        return Err(format!(
-            "Can't uninstall {}: other installed Packages depend on it: {}",
-            package.name,
-            dependents.join(", ")
-        ));
-    }
+    refuse_if_depended_on(system, package)?;
     let plan = Plan {
         targets: vec![removal(package, action)],
     };
@@ -273,29 +266,52 @@ pub fn plan_removal(
     Ok((plan, held))
 }
 
-/// The installed Packages that depend on `package`. `brew uses` only knows
-/// Formula dependencies, so a Cask has none it can report.
+/// Refuse to remove `package` if other installed Packages depend on it,
+/// naming them. A failed check refuses too, never counting as "none".
+fn refuse_if_depended_on(system: &impl System, package: &Package) -> Result<(), String> {
+    let dependents = dependents(system, package)?;
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Can't uninstall {}: other installed Packages depend on it: {}",
+        package.name,
+        dependents.join(", ")
+    ))
+}
+
+/// The installed Packages that depend on `package`, read afresh: Formulae
+/// (and Casks) from `brew uses`, which only accepts Formula names, plus the
+/// installed Casks whose `depends_on` names it.
 fn dependents(system: &impl System, package: &Package) -> Result<Vec<String>, String> {
-    if package.kind == Kind::Cask {
-        return Ok(Vec::new());
+    let failed = |e: String| format!("Could not check what depends on {}: {e}", package.name);
+    let installed = inventory::load_installed(system).map_err(|e| failed(format!("{e:#}")))?;
+    let mut dependents: Vec<String> = Vec::new();
+    if package.kind == Kind::Formula {
+        let output = system
+            .run(&Command::brew(&["uses", "--installed", &package.name]))
+            .map_err(|e| failed(format!("{e:#}")))?;
+        if !output.success {
+            return Err(failed(output.stderr.trim().to_string()));
+        }
+        dependents.extend(
+            output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from),
+        );
     }
-    let output = system
-        .run(&Command::brew(&["uses", "--installed", &package.name]))
-        .map_err(|e| format!("Could not check what depends on {}: {e:#}", package.name))?;
-    if !output.success {
-        return Err(format!(
-            "Could not check what depends on {}: {}",
-            package.name,
-            output.stderr.trim()
-        ));
+    for cask in installed
+        .iter()
+        .filter(|p| p.cask_dependencies.contains(&package.name))
+    {
+        if !dependents.contains(&cask.name) {
+            dependents.push(cask.name.clone());
+        }
     }
-    Ok(output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect())
+    Ok(dependents)
 }
 
 /// Run each target's part of a Plan in turn: check In Use just before it,
@@ -465,6 +481,18 @@ pub fn graceful(
             held,
         });
     };
+
+    // Never quit anything for a removal that would be refused.
+    if let AfterQuit::Remove(_) = after
+        && let Err(error) = refuse_if_depended_on(system, package)
+    {
+        let _ = events.send(Event::StepFinished {
+            target: package.name.clone(),
+            success: false,
+            error: Some(error),
+        });
+        return;
+    }
 
     let apps = match in_use::running_apps(system, &package.app_paths) {
         Ok(apps) if !apps.is_empty() => apps,

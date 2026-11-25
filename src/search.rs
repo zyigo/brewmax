@@ -68,7 +68,8 @@ fn info(system: &impl System, kind: Kind, names: &[String]) -> Result<Vec<Packag
         version,
         desc,
         app_paths: Vec::new(),
-        zap_paths: Vec::new(),
+        zap: Vec::new(),
+        cask_dependencies: Vec::new(),
         pinned: false,
         self_updating: false,
     };

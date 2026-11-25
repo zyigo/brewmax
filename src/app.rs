@@ -1,6 +1,7 @@
 //! The application: state, key handling and rendering. It talks to the outside
 //! world only through the [`System`] it is given.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -13,8 +14,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
 
 use crate::in_use::{self, InUse, Reason, Target};
-use crate::inventory::Kind;
 use crate::inventory::{self, Package};
+use crate::inventory::{Kind, ZapEntry};
 use crate::operation::{self, Action, AfterQuit, BREWMAX, Event, Held, Plan, QuitWait, TargetPlan};
 use crate::outdated::{self, Refresh};
 use crate::search;
@@ -187,6 +188,16 @@ pub struct App<S: System + Clone + Send + 'static> {
     marked: BTreeSet<String>,
     /// A short message for the user, shown in the footer until the next key.
     notice: Option<String>,
+    /// How far the Zap confirmation's list can scroll, as last drawn.
+    zap_view: Cell<ZapView>,
+}
+
+/// The Zap confirmation's scrollable list, as last drawn: how far it can
+/// scroll and how many rows a page is.
+#[derive(Debug, Clone, Copy, Default)]
+struct ZapView {
+    max_scroll: u16,
+    page: u16,
 }
 
 impl<S: System + Clone + Send + 'static> App<S> {
@@ -216,6 +227,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             search: SearchState::Idle,
             search_input: None,
             notice: None,
+            zap_view: Cell::new(ZapView::default()),
         }
     }
 
@@ -592,9 +604,9 @@ impl<S: System + Clone + Send + 'static> App<S> {
             self.operation = Some(Operation::refused(title, message));
             return;
         }
-        if action == Action::Zap && package.zap_paths.is_empty() {
+        if action == Action::Zap && package.zap.is_empty() {
             let message =
-                format!("{name} lists no settings or data to Zap; press x to uninstall it");
+                format!("{name} has nothing to Zap beyond an uninstall; press x to uninstall it");
             self.operation = Some(Operation::refused(title, message));
             return;
         }
@@ -808,8 +820,24 @@ impl<S: System + Clone + Send + 'static> App<S> {
                     typed.pop();
                 }
                 KeyCode::Char(c) => typed.push(c),
-                KeyCode::Down => *scroll = scroll.saturating_add(1),
-                KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::PageDown => {
+                    let view = self.zap_view.get();
+                    let step = if key.code == KeyCode::Down {
+                        1
+                    } else {
+                        view.page
+                    };
+                    *scroll = scroll.saturating_add(step).min(view.max_scroll);
+                }
+                KeyCode::Up | KeyCode::PageUp => {
+                    let view = self.zap_view.get();
+                    let step = if key.code == KeyCode::Up {
+                        1
+                    } else {
+                        view.page
+                    };
+                    *scroll = scroll.saturating_sub(step);
+                }
                 _ => {}
             }
             return;
@@ -1084,7 +1112,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             match &operation.stage {
                 Stage::Confirming => render_confirmation(frame, operation),
                 Stage::ConfirmingZap { typed, scroll } => {
-                    render_zap_confirmation(frame, operation, typed, *scroll)
+                    render_zap_confirmation(frame, operation, typed, *scroll, &self.zap_view)
                 }
                 _ => {}
             }
@@ -1476,7 +1504,9 @@ fn render_confirmation(frame: &mut Frame, operation: &Operation) {
             ));
         }
         if operation.graceful {
-            lines.push(Line::raw("Its open apps are asked to quit first."));
+            lines.push(Line::raw(
+                "It is In Use: its apps are asked to quit gracefully first.",
+            ));
         }
         lines
     } else {
@@ -1523,44 +1553,57 @@ fn render_confirmation(frame: &mut Frame, operation: &Operation) {
 
 /// The Zap confirmation: every path the Zap removes, scrollable when they
 /// don't fit, confirmed only by typing the Cask's name.
-fn render_zap_confirmation(frame: &mut Frame, operation: &Operation, typed: &str, scroll: u16) {
+fn render_zap_confirmation(
+    frame: &mut Frame,
+    operation: &Operation,
+    typed: &str,
+    scroll: u16,
+    view: &Cell<ZapView>,
+) {
     let Some(package) = &operation.package else {
         return;
     };
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let mut lines = vec![
-        Line::raw(format!(
-            "Zap uninstalls {} and deletes these settings, caches and data:",
-            package.name
-        )),
-        Line::default(),
-    ];
-    lines.extend(
-        package
-            .zap_paths
-            .iter()
-            .map(|path| Line::raw(format!("  {path}"))),
-    );
+    let mut lines = vec![Line::raw(format!(
+        "Zap uninstalls {} and also does all of this:",
+        package.name
+    ))];
+    let home = std::env::var("HOME").ok();
+    lines.extend(zap_lines(&package.zap, home.as_deref()));
     if operation.graceful {
         lines.push(Line::default());
-        lines.push(Line::raw("Its open apps are asked to quit first."));
+        lines.push(Line::raw(
+            "It is In Use: its apps are asked to quit gracefully first.",
+        ));
     }
-    lines.push(Line::default());
-    lines.push(Line::styled("This cannot be undone.", bold));
-    lines.push(Line::styled(
-        format!(
-            "Type {} and press Enter to Zap, Esc to cancel: {typed}▏",
-            package.name
+    let footer = Paragraph::new(vec![
+        Line::default(),
+        Line::styled("This cannot be undone.", bold),
+        Line::styled(
+            format!(
+                "Type {} and press Enter to Zap, Esc to cancel: {typed}▏",
+                package.name
+            ),
+            bold,
         ),
-        bold,
-    ));
+    ])
+    .wrap(Wrap { trim: false });
+    let list = Paragraph::new(lines).wrap(Wrap { trim: false });
+
     let area = frame.area();
     let width = 100.min(area.width);
-    let inner = width.saturating_sub(2).max(1) as usize;
-    // Rows once wrapped, so a long list scrolls instead of being cut off.
-    let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(inner)).sum();
-    let height = (rows as u16 + 2).min(area.height);
-    let max_scroll = (rows as u16 + 2).saturating_sub(height);
+    let inner_width = width.saturating_sub(2);
+    // Heights once wrapped, measured the way the paragraphs wrap them.
+    let footer_rows = footer.line_count(inner_width) as u16;
+    let list_rows = list.line_count(inner_width) as u16;
+    let height = (list_rows + footer_rows + 2).min(area.height);
+    let list_height = height.saturating_sub(footer_rows + 2).max(1);
+    let max_scroll = list_rows.saturating_sub(list_height);
+    view.set(ZapView {
+        max_scroll,
+        page: list_height,
+    });
+
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1568,18 +1611,67 @@ fn render_zap_confirmation(frame: &mut Frame, operation: &Operation, typed: &str
         height,
     };
     let title = if max_scroll > 0 {
-        format!(" Confirm: {} (↑↓ scroll) ", operation.title)
+        format!(" Confirm: {} (↑↓ PgUp PgDn scroll) ", operation.title)
     } else {
         format!(" Confirm: {} ", operation.title)
     };
+    let block = Block::bordered().title(title);
+    let [list_area, footer_area] =
+        Layout::vertical([Constraint::Length(list_height), Constraint::Fill(1)])
+            .areas(block.inner(popup));
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll.min(max_scroll), 0))
-            .block(Block::bordered().title(title)),
-        popup,
-    );
+    frame.render_widget(block, popup);
+    frame.render_widget(list.scroll((scroll.min(max_scroll), 0)), list_area);
+    frame.render_widget(footer, footer_area);
+}
+
+/// A Zap's entries grouped under a heading per kind, paths with `~` shown
+/// under `home` and wildcard paths marked as patterns.
+fn zap_lines(zap: &[ZapEntry], home: Option<&str>) -> Vec<Line<'static>> {
+    let path = |p: &str| {
+        let shown = match (p.strip_prefix('~'), home) {
+            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+                format!("{home}{rest}")
+            }
+            _ => p.to_string(),
+        };
+        if p.contains(['*', '?', '[']) {
+            format!("{shown}  (pattern)")
+        } else {
+            shown
+        }
+    };
+    const HEADINGS: [&str; 7] = [
+        "Deleted or moved to the Trash:",
+        "Removed if empty:",
+        "Background services unloaded:",
+        "Package receipts forgotten:",
+        "Login items removed:",
+        "Scripts run:",
+        "Other zap steps (as the Cask writes them):",
+    ];
+    // Each entry's group (an index into HEADINGS) and how it's shown.
+    let shown = |entry: &ZapEntry| match entry {
+        ZapEntry::Remove(p) => (0, path(p)),
+        ZapEntry::RemoveIfEmpty(p) => (1, path(p)),
+        ZapEntry::Service(s) => (2, s.clone()),
+        ZapEntry::Receipt(s) => (3, s.clone()),
+        ZapEntry::LoginItem(s) => (4, s.clone()),
+        ZapEntry::Script(p) => (5, path(p)),
+        ZapEntry::Other(s) => (6, s.clone()),
+    };
+    let entries: Vec<(usize, String)> = zap.iter().map(shown).collect();
+    let mut lines = Vec::new();
+    for (group, heading) in HEADINGS.iter().enumerate() {
+        let mut group_entries = entries.iter().filter(|(g, _)| *g == group).peekable();
+        if group_entries.peek().is_none() {
+            continue;
+        }
+        lines.push(Line::default());
+        lines.push(Line::raw(*heading));
+        lines.extend(group_entries.map(|(_, text)| Line::raw(format!("  {text}"))));
+    }
+    lines
 }
 
 /// Is `target` held because one of its own apps is open (so `g` can help)?

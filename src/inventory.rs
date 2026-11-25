@@ -27,12 +27,34 @@ pub struct Package {
     pub desc: Option<String>,
     /// For Casks: where their `.app` bundles are installed.
     pub app_paths: Vec<String>,
-    /// For Casks: the settings, caches and data a Zap removes, as the Cask
-    /// lists them (paths may start with `~` or contain wildcards).
-    pub zap_paths: Vec<String>,
+    /// For Casks: everything a Zap removes beyond an ordinary uninstall, as
+    /// the Cask's zap stanza lists it.
+    pub zap: Vec<ZapEntry>,
+    /// For Casks: the Casks it depends on.
+    pub cask_dependencies: Vec<String>,
     pub pinned: bool,
     /// A Cask that updates itself, so brew only treats it as outdated when asked to.
     pub self_updating: bool,
+}
+
+/// One thing a Zap removes or does, from a Cask's zap stanza. Paths are as
+/// the Cask writes them: they may start with `~` or contain wildcards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZapEntry {
+    /// A file or folder deleted or moved to the Trash (`trash`, `delete`).
+    Remove(String),
+    /// A folder removed only if it is empty (`rmdir`).
+    RemoveIfEmpty(String),
+    /// A background service unloaded (`launchctl`).
+    Service(String),
+    /// A package receipt forgotten (`pkgutil`).
+    Receipt(String),
+    /// A login item removed (`login_item`).
+    LoginItem(String),
+    /// A script run, by its executable (`script`).
+    Script(String),
+    /// A directive brewmax doesn't recognise, as `key: value` written.
+    Other(String),
 }
 
 #[derive(Deserialize)]
@@ -69,6 +91,8 @@ struct CaskJson {
     pinned: bool,
     #[serde(default)]
     auto_updates: Option<bool>,
+    #[serde(default)]
+    depends_on: serde_json::Value,
 }
 
 /// The installed locations of a Cask's `.app` bundles. Homebrew records the
@@ -93,28 +117,67 @@ fn app_paths(artifacts: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// Everything a Cask's `zap` stanza trashes or deletes. Each of `trash`,
-/// `delete` and `rmdir` may be one path or a list.
-fn zap_paths(artifacts: &[serde_json::Value]) -> Vec<String> {
-    artifacts
+/// A JSON value that may be one string or a list of them, as strings.
+/// Anything else is `Err` with the value as written.
+fn strings(value: &serde_json::Value) -> Vec<Result<String, String>> {
+    let one = |v: &serde_json::Value| v.as_str().map(String::from).ok_or_else(|| v.to_string());
+    match value {
+        serde_json::Value::Array(values) => values.iter().map(one).collect(),
+        value => vec![one(value)],
+    }
+}
+
+/// The Casks a Cask depends on (`depends_on.cask`, one name or a list).
+fn cask_dependencies(depends_on: &serde_json::Value) -> Vec<String> {
+    depends_on
+        .get("cask")
+        .map(|casks| strings(casks).into_iter().filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// Every entry of a Cask's zap stanza: the directives brewmax knows, in a
+/// fixed order, then any others as written.
+fn zap(artifacts: &[serde_json::Value]) -> Vec<ZapEntry> {
+    type Make = fn(String) -> ZapEntry;
+    const KNOWN: [(&str, Make); 7] = [
+        ("trash", ZapEntry::Remove),
+        ("delete", ZapEntry::Remove),
+        ("rmdir", ZapEntry::RemoveIfEmpty),
+        ("launchctl", ZapEntry::Service),
+        ("pkgutil", ZapEntry::Receipt),
+        ("login_item", ZapEntry::LoginItem),
+        ("script", ZapEntry::Script),
+    ];
+    let directives = artifacts
         .iter()
         .filter_map(|artifact| artifact.get("zap")?.as_array())
         .flatten()
-        .flat_map(|directive| {
-            ["trash", "delete", "rmdir"]
-                .into_iter()
-                .filter_map(|key| directive.get(key))
-                .flat_map(|paths| match paths {
-                    serde_json::Value::String(path) => vec![path.clone()],
-                    serde_json::Value::Array(paths) => paths
-                        .iter()
-                        .filter_map(|p| p.as_str().map(String::from))
-                        .collect(),
-                    _ => Vec::new(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+        .filter_map(|directive| directive.as_object());
+    let mut entries = Vec::new();
+    for directive in directives {
+        for (key, make) in KNOWN {
+            let Some(value) = directive.get(key) else {
+                continue;
+            };
+            // A script may be an object naming its executable.
+            let value = match (key, value.get("executable")) {
+                ("script", Some(executable)) => executable,
+                _ => value,
+            };
+            for item in strings(value) {
+                entries.push(match item {
+                    Ok(text) => make(text),
+                    Err(raw) => ZapEntry::Other(format!("{key}: {raw}")),
+                });
+            }
+        }
+        for (key, value) in directive {
+            if !KNOWN.iter().any(|(known, _)| known == key) {
+                entries.push(ZapEntry::Other(format!("{key}: {value}")));
+            }
+        }
+    }
+    entries
 }
 
 /// Read every installed Package, sorted by name.
@@ -135,14 +198,16 @@ pub fn load_installed(system: &impl System) -> anyhow::Result<Vec<Package>> {
         kind: Kind::Formula,
         desc: f.desc,
         app_paths: Vec::new(),
-        zap_paths: Vec::new(),
+        zap: Vec::new(),
+        cask_dependencies: Vec::new(),
         pinned: f.pinned,
         self_updating: false,
     });
     let casks = info.casks.into_iter().map(|c| Package {
         version: c.installed.unwrap_or_default(),
         app_paths: app_paths(&c.artifacts),
-        zap_paths: zap_paths(&c.artifacts),
+        zap: zap(&c.artifacts),
+        cask_dependencies: cask_dependencies(&c.depends_on),
         pinned: c.pinned,
         self_updating: c.auto_updates.unwrap_or(false),
         name: c.token,

@@ -164,17 +164,29 @@ fn searches_the_real_catalog_and_plans_an_install_without_installing() {
 
 #[test]
 #[ignore = "needs a real Homebrew installation"]
-fn reads_the_real_zap_paths_of_installed_casks() {
+fn reads_the_real_zap_stanzas_and_cask_dependencies() {
+    use brewmax::inventory::ZapEntry;
+
     let packages = inventory::load_installed(&MacSystem).expect("brew info should parse");
-    for package in packages.iter().filter(|p| p.kind == Kind::Cask) {
-        for path in &package.zap_paths {
-            assert!(!path.is_empty(), "{} has an empty zap path", package.name);
+    for package in &packages {
+        if package.kind == Kind::Formula {
+            assert!(package.zap.is_empty() && package.cask_dependencies.is_empty());
+            continue;
+        }
+        for dependency in &package.cask_dependencies {
+            assert!(
+                packages
+                    .iter()
+                    .any(|p| &p.name == dependency && p.kind == Kind::Cask),
+                "{} depends on {dependency}, which is not an installed Cask",
+                package.name
+            );
+        }
+        for entry in &package.zap {
+            // Unrecognised directives are kept as written, never dropped.
+            if let ZapEntry::Other(raw) = entry {
+                eprintln!("{}: unrecognised zap entry {raw}", package.name);
+            }
         }
     }
-    assert!(
-        packages
-            .iter()
-            .all(|p| p.kind == Kind::Cask || p.zap_paths.is_empty()),
-        "only Casks have zap paths"
-    );
 }
