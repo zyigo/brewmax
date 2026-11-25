@@ -1,6 +1,7 @@
 //! The application: state, key handling and rendering. It talks to the outside
 //! world only through the [`System`] it is given.
 
+use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState, Tabs, Wr
 
 use crate::in_use::{self, InUse, Reason, Target};
 use crate::inventory::{self, Package};
-use crate::operation::{self, BREWMAX, Event, Held, Plan};
+use crate::operation::{self, BREWMAX, Event, Held, Plan, TargetPlan};
 use crate::outdated::{self, Refresh};
 use crate::system::System;
 
@@ -53,38 +54,60 @@ enum RefreshState {
 
 /// Where the current operation has got to.
 enum Stage {
-    /// Working out the Plan (dry run and In Use check).
+    /// Working out the Plan (dry runs and In Use check).
     Planning,
     /// Waiting for the user to confirm a Plan with more than one Package.
     Confirming,
-    /// Running `brew`.
+    /// Running `brew`, target by target.
     Running,
-    /// Left unchanged because something in the Plan is In Use.
+    /// Left entirely unchanged because everything in the Plan is held.
     Held(Held),
-    /// Finished, or refused before starting; `ok` says whether it worked.
+    /// Ran (some of) the Plan; what happened to each target.
+    Finished(Summary),
+    /// Refused, cancelled or failed before anything ran.
     Done { ok: bool, message: String },
+}
+
+/// What happened to each target of a run.
+#[derive(Debug, Default)]
+struct Summary {
+    updated: Vec<String>,
+    /// Targets left unchanged, with what was In Use.
+    held: Vec<(String, Held)>,
+    /// Targets brew failed on, with any error from running it.
+    failed: Vec<(String, Option<String>)>,
 }
 
 /// The one operation brewmax is running or last ran.
 struct Operation {
     /// What the operation is, e.g. "Update ffmpeg".
     title: String,
+    /// The part of the Plan that will run.
     plan: Option<Plan>,
+    /// Targets held already at planning, with what was In Use.
+    pre_held: Vec<(String, Held)>,
     stage: Stage,
+    summary: Summary,
     /// `brew` output and progress notes.
     log: Vec<String>,
     events: Option<Receiver<Event>>,
 }
 
 impl Operation {
-    fn refused(title: String, message: String) -> Self {
+    fn new(title: String, stage: Stage) -> Self {
         Operation {
             title,
             plan: None,
-            stage: Stage::Done { ok: false, message },
+            pre_held: Vec::new(),
+            stage,
+            summary: Summary::default(),
             log: Vec::new(),
             events: None,
         }
+    }
+
+    fn refused(title: String, message: String) -> Self {
+        Self::new(title, Stage::Done { ok: false, message })
     }
 
     /// Whether brew may be changing things right now (so nothing else may
@@ -125,6 +148,8 @@ pub struct App<S: System + Clone + Send + 'static> {
     scan_in_flight: Option<Receiver<anyhow::Result<InUse>>>,
 
     operation: Option<Operation>,
+    /// Packages marked (with space) to update together.
+    marked: BTreeSet<String>,
     /// A short message for the user, shown in the footer until the next key.
     notice: Option<String>,
 }
@@ -151,6 +176,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             last_scan: None,
             scan_in_flight: None,
             operation: None,
+            marked: BTreeSet::new(),
             notice: None,
         }
     }
@@ -197,12 +223,35 @@ impl<S: System + Clone + Send + 'static> App<S> {
         self.packages.iter().map(Target::from).collect()
     }
 
-    /// Start updating the selected Package.
-    fn update_selected(&mut self) {
+    fn refuse_if_busy(&mut self) -> bool {
         if let Some(operation) = &self.operation
             && operation.busy()
         {
             self.notice = Some(format!("Busy: wait for “{}” to finish", operation.title));
+            return true;
+        }
+        false
+    }
+
+    fn is_outdated(&self, package: &Package) -> bool {
+        self.outdated()
+            .is_some_and(|o| o.contains_key(&package.name))
+    }
+
+    /// `u`: update the marked Packages, or the selected one if none are marked.
+    fn update(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        if !self.marked.is_empty() {
+            let candidates: Vec<Package> = self
+                .packages
+                .iter()
+                .filter(|p| self.marked.contains(&p.name))
+                .cloned()
+                .collect();
+            let title = format!("Update {} marked packages", candidates.len());
+            self.start_update(title, candidates);
             return;
         }
         let Some(package) = self.selected_package().cloned() else {
@@ -210,13 +259,8 @@ impl<S: System + Clone + Send + 'static> App<S> {
         };
         let title = format!("Update {}", package.name);
         if package.name == BREWMAX {
-            self.operation = Some(Operation {
-                title,
-                plan: None,
-                stage: Stage::Held(vec![(BREWMAX.to_string(), vec![Reason::Brewmax])]),
-                log: Vec::new(),
-                events: None,
-            });
+            let held = vec![(BREWMAX.to_string(), vec![Reason::Brewmax])];
+            self.operation = Some(Operation::new(title, Stage::Held(held)));
             return;
         }
         if package.pinned {
@@ -224,12 +268,78 @@ impl<S: System + Clone + Send + 'static> App<S> {
             self.operation = Some(Operation::refused(title, message));
             return;
         }
-        if self
-            .outdated()
-            .is_some_and(|o| !o.contains_key(&package.name))
-        {
+        if self.outdated().is_some() && !self.is_outdated(&package) {
             let message = format!("{} is already up to date", package.name);
             self.operation = Some(Operation::refused(title, message));
+            return;
+        }
+        self.start_update(title, vec![package]);
+    }
+
+    /// `U`: update every outdated Package except Pinned and Self-Updating
+    /// ones, plus any Self-Updating Casks that are marked.
+    fn update_all(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        if self.outdated().is_none() {
+            let message = match &self.refresh {
+                RefreshState::Done(Refresh {
+                    outdated: Err(error),
+                    ..
+                }) => format!("Could not check for updates: {error}"),
+                _ => "Still checking for updates; try again when the refresh finishes".to_string(),
+            };
+            self.operation = Some(Operation::refused("Update all".to_string(), message));
+            return;
+        }
+        let candidates: Vec<Package> = self
+            .packages
+            .iter()
+            .filter(|p| self.is_outdated(p) && !p.pinned)
+            .filter(|p| !p.self_updating || self.marked.contains(&p.name))
+            .cloned()
+            .collect();
+        self.start_update("Update all".to_string(), candidates);
+    }
+
+    /// Plan an update of `candidates` in the background. Pinned and
+    /// up-to-date candidates are skipped; brewmax is held.
+    fn start_update(&mut self, title: String, candidates: Vec<Package>) {
+        let mut operation = Operation::new(title, Stage::Planning);
+        let mut packages = Vec::new();
+        for package in candidates {
+            if package.name == BREWMAX {
+                let held = vec![(BREWMAX.to_string(), vec![Reason::Brewmax])];
+                operation.pre_held.push((BREWMAX.to_string(), held));
+            } else if package.pinned {
+                operation
+                    .log
+                    .push(format!("Skipped {}: Pinned", package.name));
+            } else if self.outdated().is_some() && !self.is_outdated(&package) {
+                operation
+                    .log
+                    .push(format!("Skipped {}: already up to date", package.name));
+            } else {
+                packages.push(package);
+            }
+        }
+        if packages.is_empty() {
+            operation.stage = if operation.pre_held.is_empty() {
+                Stage::Done {
+                    ok: false,
+                    message: "Nothing to update".to_string(),
+                }
+            } else {
+                Stage::Held(
+                    operation
+                        .pre_held
+                        .iter()
+                        .flat_map(|(_, h)| h.clone())
+                        .collect(),
+                )
+            };
+            self.operation = Some(operation);
             return;
         }
 
@@ -237,18 +347,15 @@ impl<S: System + Clone + Send + 'static> App<S> {
         let targets = self.targets();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Planned(operation::plan(&system, &package, &targets)));
+            let _ = tx.send(Event::Planned(operation::plan(
+                &system, &packages, &targets,
+            )));
         });
-        self.operation = Some(Operation {
-            title,
-            plan: None,
-            stage: Stage::Planning,
-            log: Vec::new(),
-            events: Some(rx),
-        });
+        operation.events = Some(rx);
+        self.operation = Some(operation);
     }
 
-    /// Run the current operation's Plan in the background.
+    /// Run the runnable part of the current operation's Plan in the background.
     fn execute(&mut self) {
         let targets = self.targets();
         let Some(operation) = &mut self.operation else {
@@ -257,15 +364,59 @@ impl<S: System + Clone + Send + 'static> App<S> {
         let Some(plan) = operation.plan.clone() else {
             return;
         };
+        operation.summary.held = operation.pre_held.clone();
         let system = self.system.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || operation::execute(&system, &plan, &targets, &tx));
-        operation.log.push(format!(
-            "$ {}",
-            operation.plan.as_ref().unwrap().upgrade_command()
-        ));
+        std::thread::spawn(move || operation::execute(&system, &plan.targets, &targets, &tx));
         operation.stage = Stage::Running;
         operation.events = Some(rx);
+    }
+
+    /// Split a freshly made Plan into the targets that can run and those held
+    /// because something in their part of the Plan is In Use.
+    fn planned(&mut self, plan: Plan, held: Held) {
+        let Some(operation) = &mut self.operation else {
+            return;
+        };
+        let (runnable, held_targets): (Vec<TargetPlan>, Vec<TargetPlan>) =
+            plan.targets.into_iter().partition(|t| {
+                !t.steps
+                    .iter()
+                    .any(|s| held.iter().any(|(n, _)| *n == s.name))
+            });
+        for target in held_targets {
+            let target_held = held
+                .iter()
+                .filter(|(name, _)| target.steps.iter().any(|s| s.name == *name))
+                .cloned()
+                .collect();
+            operation.pre_held.push((target.target, target_held));
+        }
+        if runnable.is_empty() {
+            let all: Held = operation
+                .pre_held
+                .iter()
+                .flat_map(|(_, h)| h.clone())
+                .collect();
+            operation.stage = Stage::Held(all);
+            return;
+        }
+        let plan = Plan { targets: runnable };
+        let needs_confirmation = plan.needs_confirmation() || !operation.pre_held.is_empty();
+        operation.plan = Some(plan);
+        if needs_confirmation {
+            operation.stage = Stage::Confirming;
+        } else {
+            self.execute();
+        }
+    }
+
+    fn toggle_mark(&mut self) {
+        if let Some(name) = self.selected_package().map(|p| p.name.clone())
+            && !self.marked.remove(&name)
+        {
+            self.marked.insert(name);
+        }
     }
 
     /// Apply the current operation's pending events. Returns whether its
@@ -313,36 +464,33 @@ impl<S: System + Clone + Send + 'static> App<S> {
         };
         match event {
             Event::Planned(Err(error)) => {
+                for (target, held) in &operation.pre_held {
+                    operation
+                        .log
+                        .push(format!("Held: {target} ({})", in_use_description(held)));
+                }
                 operation.stage = Stage::Done {
                     ok: false,
                     message: error,
                 };
             }
-            Event::Planned(Ok((plan, held))) => {
-                let needs_confirmation = plan.needs_confirmation();
-                operation.plan = Some(plan);
-                if !held.is_empty() {
-                    operation.stage = Stage::Held(held);
-                } else if needs_confirmation {
-                    operation.stage = Stage::Confirming;
+            Event::Planned(Ok((plan, held))) => self.planned(plan, held),
+            Event::StepHeld { target, held } => operation.summary.held.push((target, held)),
+            Event::Line(line) => operation.log.push(line),
+            Event::StepFinished {
+                target,
+                success,
+                error,
+            } => {
+                if success && error.is_none() {
+                    operation.summary.updated.push(target);
                 } else {
-                    self.execute();
+                    operation.summary.failed.push((target, error));
                 }
             }
-            Event::Held(held) => operation.stage = Stage::Held(held),
-            Event::Line(line) => operation.log.push(line),
-            Event::Finished { success, error } => {
-                let message = match (&error, success) {
-                    (Some(error), _) => error.clone(),
-                    (None, true) => format!("{}: done", operation.title),
-                    (None, false) => format!("{}: brew reported a failure", operation.title),
-                };
-                operation.stage = Stage::Done {
-                    ok: success && error.is_none(),
-                    message,
-                };
-            }
             Event::Reloaded { packages, outdated } => {
+                operation.stage = Stage::Finished(std::mem::take(&mut operation.summary));
+                self.marked.clear();
                 if let Ok(packages) = packages {
                     self.packages = packages;
                 }
@@ -478,7 +626,9 @@ impl<S: System + Clone + Send + 'static> App<S> {
                 self.clamp_selection();
             }
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('u') => self.update_selected(),
+            KeyCode::Char('u') => self.update(),
+            KeyCode::Char('U') => self.update_all(),
+            KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('q') => match &self.operation {
                 Some(operation) if operation.busy() => {
                     self.notice = Some(format!(
@@ -582,7 +732,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             Constraint::Length(1),
         ])
         .areas(frame.area());
-        let log_height = if self.operation.is_some() { 9 } else { 0 };
+        let log_height = if self.operation.is_some() { 10 } else { 0 };
         let [main_area, log_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(log_height)])
                 .areas(main_area);
@@ -700,8 +850,13 @@ impl<S: System + Clone + Send + 'static> App<S> {
             (Tab::Outdated, Some(available)) => format!("{} → {available}", package.version),
             _ => package.version.clone(),
         };
+        let name = if self.marked.contains(&package.name) {
+            format!("✓ {}", package.name)
+        } else {
+            package.name.clone()
+        };
         Row::new(vec![
-            package.name.clone(),
+            name,
             tags.join(" "),
             package.kind.label().to_string(),
             versions,
@@ -768,15 +923,15 @@ impl<S: System + Clone + Send + 'static> App<S> {
             format!("  [filter: {}]", self.filter)
         };
         Paragraph::new(format!(
-            " ↑↓/jk move · Tab switch tab · u update · / filter · ? help · q quit{filter}"
+            " ↑↓/jk move · Tab tab · space mark · u update · U update all · / filter · ? help · q quit{filter}"
         ))
     }
 }
 
 fn render_help(frame: &mut Frame) {
     let area = frame.area();
-    let width = 50.min(area.width);
-    let height = 14.min(area.height);
+    let width = 60.min(area.width);
+    let height = 16.min(area.height);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -786,7 +941,9 @@ fn render_help(frame: &mut Frame) {
     let lines = [
         ("↑ ↓  j k", "Move the selection"),
         ("Tab  1 2", "Switch between Installed and Outdated"),
-        ("u", "Update the selected Package"),
+        ("space", "Mark or unmark the selected Package"),
+        ("u", "Update the marked Packages, or the selected one"),
+        ("U", "Update all (not Pinned or Self-Updating)"),
         ("/", "Filter the list by name"),
         ("Enter", "Keep the filter, back to the list"),
         ("Esc", "Clear the filter"),
@@ -853,18 +1010,17 @@ fn summarise(reasons: &[Reason]) -> Vec<String> {
 /// The bottom pane: what the operation is doing and `brew`'s latest output.
 fn render_operation(frame: &mut Frame, area: Rect, operation: &Operation) {
     let status = match &operation.stage {
-        Stage::Planning => "Working out what would change…".to_string(),
-        Stage::Confirming => "Waiting for confirmation".to_string(),
-        Stage::Running => "Running…".to_string(),
-        Stage::Held(held) => held_message(held),
-        Stage::Done { ok: true, message } => format!("✔ {message}"),
-        Stage::Done { ok: false, message } => format!("✘ {message}"),
+        Stage::Planning => vec!["Working out what would change…".to_string()],
+        Stage::Confirming => vec!["Waiting for confirmation".to_string()],
+        Stage::Running => vec!["Running…".to_string()],
+        Stage::Held(held) => vec![held_message(held)],
+        Stage::Finished(summary) => summary_lines(&operation.title, summary),
+        Stage::Done { ok: true, message } => vec![format!("✔ {message}")],
+        Stage::Done { ok: false, message } => vec![format!("✘ {message}")],
     };
-    let visible = area.height.saturating_sub(3) as usize;
-    let mut lines = vec![Line::styled(
-        status,
-        Style::new().add_modifier(Modifier::BOLD),
-    )];
+    let visible = (area.height as usize).saturating_sub(2 + status.len());
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = status.into_iter().map(|s| Line::styled(s, bold)).collect();
     let skip = operation.log.len().saturating_sub(visible);
     lines.extend(
         operation
@@ -879,38 +1035,73 @@ fn render_operation(frame: &mut Frame, area: Rect, operation: &Operation) {
     );
 }
 
+/// What happened in a run, one line per outcome.
+fn summary_lines(title: &str, summary: &Summary) -> Vec<String> {
+    if summary.held.is_empty() && summary.failed.is_empty() {
+        return vec![format!("✔ {title}: done")];
+    }
+    let mut lines = Vec::new();
+    if !summary.updated.is_empty() {
+        lines.push(format!("✔ Updated: {}", summary.updated.join(", ")));
+    }
+    for (target, held) in &summary.held {
+        lines.push(format!("⏸ Held: {target} ({})", in_use_description(held)));
+    }
+    for (target, error) in &summary.failed {
+        match error {
+            Some(error) => lines.push(format!("✘ Failed: {target}: {error}")),
+            None => lines.push(format!("✘ Failed: {target} (see the log below)")),
+        }
+    }
+    lines
+}
+
+/// "x265 is In Use by obs (pid 950); …"
+fn in_use_description(held: &Held) -> String {
+    held.iter()
+        .map(|(name, reasons)| format!("{name} is In Use by {}", summarise(reasons).join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn held_message(held: &Held) -> String {
     if held.iter().any(|(name, _)| name == BREWMAX) {
         return "Held: brewmax can't update itself while running. Quit and run `brew upgrade brewmax`."
             .to_string();
     }
-    let parts: Vec<String> = held
-        .iter()
-        .map(|(name, reasons)| format!("{name} is In Use by {}", summarise(reasons).join(", ")))
-        .collect();
-    format!("Held, nothing was changed: {}", parts.join("; "))
+    format!("Held, nothing was changed: {}", in_use_description(held))
 }
 
 fn render_confirmation(frame: &mut Frame, operation: &Operation) {
     let Some(plan) = &operation.plan else {
         return;
     };
+    let steps = plan.steps();
     let mut lines = vec![
-        Line::raw(format!("This will change {} packages:", plan.steps.len())),
+        Line::raw(format!("This will change {} packages:", steps.len())),
         Line::default(),
     ];
     lines.extend(
-        plan.steps
+        steps
             .iter()
             .map(|step| Line::raw(format!("  {:<20} {} → {}", step.name, step.from, step.to))),
     );
+    if !operation.pre_held.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::raw("Held, will not change:"));
+        lines.extend(
+            operation.pre_held.iter().map(|(target, held)| {
+                Line::raw(format!("  {target}: {}", in_use_description(held)))
+            }),
+        );
+    }
     lines.push(Line::default());
     lines.push(Line::styled(
         "Continue? y / n",
         Style::new().add_modifier(Modifier::BOLD),
     ));
     let area = frame.area();
-    let width = 60.min(area.width);
+    let width = 80.min(area.width);
     let height = (lines.len() as u16 + 2).min(area.height);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,

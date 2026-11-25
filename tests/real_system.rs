@@ -101,11 +101,11 @@ fn plans_a_real_update_without_changing_anything() {
     };
     let targets: Vec<_> = packages.iter().map(brewmax::in_use::Target::from).collect();
 
-    let (plan, held) =
-        brewmax::operation::plan(&MacSystem, target, &targets).expect("dry run should parse");
+    let (plan, held) = brewmax::operation::plan(&MacSystem, std::slice::from_ref(target), &targets)
+        .expect("dry run should parse");
 
     assert!(
-        plan.steps
+        plan.steps()
             .iter()
             .any(|s| s.name == target.name && !s.to.is_empty()),
         "{plan:#?}"
