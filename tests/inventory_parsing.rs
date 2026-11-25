@@ -4,7 +4,7 @@
 mod support;
 
 use brewmax::inventory::{self, Package, ZapEntry};
-use support::{FakeSystem, INSTALLED_CMD};
+use support::{FakeSystem, INSTALLED_CMD, one_cask_json as cask};
 
 fn load(json: &str) -> Vec<Package> {
     inventory::load_installed(&FakeSystem::new().on(INSTALLED_CMD, json)).expect("parses")
@@ -15,15 +15,6 @@ fn package<'a>(packages: &'a [Package], name: &str) -> &'a Package {
         .iter()
         .find(|p| p.name == name)
         .unwrap_or_else(|| panic!("no {name} in {packages:#?}"))
-}
-
-fn cask(token: &str, extra: &str) -> String {
-    let extra = if extra.is_empty() {
-        String::new()
-    } else {
-        format!(", {extra}")
-    };
-    format!(r#"{{"formulae": [], "casks": [{{"token": "{token}", "installed": "1.0"{extra}}}]}}"#)
 }
 
 #[test]

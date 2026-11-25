@@ -3,7 +3,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::KeyCode;
-use support::{FakeSystem, Harness, INSTALLED_CMD};
+use support::{FakeSystem, HOME, Harness, INSTALLED_CMD, one_cask_json};
 
 const UPDATE_CMD: &str = "brew update";
 const OUTDATED_CMD: &str = "brew outdated --json=v2 --greedy";
@@ -276,14 +276,13 @@ fn zap_lists_every_path_and_says_it_cannot_be_undone() {
     h.settle();
 
     let screen = h.screen();
-    let home = std::env::var("HOME").expect("HOME is set");
     for path in [
         "/Library/Application Support/Slack",
         "/Library/Caches/com.tinyspeck.slackmacgap*",
         "/Library/Preferences/com.tinyspeck.slackmacgap.plist",
         "/Library/Slack",
     ] {
-        let path = format!("{home}{path}");
+        let path = format!("{HOME}{path}");
         assert!(screen.contains(&path), "{path} missing:\n{screen}");
     }
     assert!(screen.contains("cannot be undone"), "{screen}");
@@ -513,7 +512,7 @@ fn zapping_a_cask_another_installed_cask_depends_on_is_refused() {
     h.settle();
 
     let screen = h.screen();
-    assert!(screen.contains("Can't uninstall slack"), "{screen}");
+    assert!(screen.contains("Can't Zap slack"), "{screen}");
     assert!(screen.contains("slack-huddles"), "{screen}");
     h.type_text("slack");
     h.press(KeyCode::Enter);
@@ -567,10 +566,12 @@ fn g_then_uninstall_checks_dependents_again_before_quitting_anything() {
 // ---- The full Zap list -------------------------------------------------
 
 fn slack_zapping(stanza: &str) -> String {
-    format!(
-        r#"{{"formulae": [], "casks": [{{"token": "slack", "installed": "4.46.0",
-            "artifacts": [{{"app": ["Slack.app"], "target": "/Applications/Slack.app"}},
-                          {{"zap": [{stanza}]}}]}}]}}"#
+    one_cask_json(
+        "slack",
+        &format!(
+            r#""artifacts": [{{"app": ["Slack.app"], "target": "/Applications/Slack.app"}},
+                             {{"zap": [{stanza}]}}]"#
+        ),
     )
 }
 
@@ -594,10 +595,10 @@ fn zap_shows_every_kind_of_entry_grouped() {
         ("Deleted or moved to the Trash", "/Library/Slack/Cache"),
         ("Removed if empty", "/Library/Slack"),
         ("Background services unloaded", "com.slack.helper"),
-        ("Package receipts forgotten", "com.slack.pkg"),
+        ("Installer receipts forgotten", "com.slack.pkg"),
         ("Login items removed", "Slack Helper"),
         ("Scripts run", "/opt/slack/cleanup.sh"),
-        ("Other zap steps", r#"signal: [["TERM","com.slack"]]"#),
+        ("Other Zap steps", r#"signal: [["TERM","com.slack"]]"#),
     ] {
         assert!(screen.contains(heading), "{heading} missing:\n{screen}");
         assert!(screen.contains(entry), "{entry} missing:\n{screen}");
@@ -606,15 +607,11 @@ fn zap_shows_every_kind_of_entry_grouped() {
 
 #[test]
 fn zap_shows_home_paths_expanded_and_marks_patterns() {
-    let home = std::env::var("HOME").expect("HOME is set");
     let h = zap_screen(r#"{"trash": ["~/Library/Slack", "~/Library/Caches/com.slack*"]}"#);
     let screen = h.screen();
+    assert!(screen.contains("/Users/tester/Library/Slack"), "{screen}");
     assert!(
-        screen.contains(&format!("{home}/Library/Slack")),
-        "{screen}"
-    );
-    assert!(
-        screen.contains(&format!("{home}/Library/Caches/com.slack*  (pattern)")),
+        screen.contains("/Users/tester/Library/Caches/com.slack*  (pattern)"),
         "{screen}"
     );
     assert!(!screen.contains("~/Library"), "{screen}");
@@ -632,9 +629,11 @@ fn a_zap_with_only_services_can_still_be_confirmed() {
 
 #[test]
 fn zap_is_refused_for_a_cask_with_an_empty_or_missing_zap_stanza() {
-    let missing = r#"{"formulae": [], "casks": [{"token": "slack", "installed": "4.46.0",
-        "artifacts": [{"app": ["Slack.app"], "target": "/Applications/Slack.app"}]}]}"#;
-    for json in [slack_zapping("{}"), slack_zapping(""), missing.to_string()] {
+    let missing = one_cask_json(
+        "slack",
+        r#""artifacts": [{"app": ["Slack.app"], "target": "/Applications/Slack.app"}]"#,
+    );
+    for json in [slack_zapping("{}"), slack_zapping(""), missing] {
         let mut h = ready(machine().on(INSTALLED_CMD, &json), "slack");
         h.press_char('Z');
         h.settle();
@@ -739,5 +738,5 @@ fn a_zap_list_that_fits_shows_no_scroll_hint() {
     h.press(KeyCode::Down);
     assert!(h.screen().contains("/Library/Slack"), "{}", h.screen());
     let h = long_zap();
-    assert!(h.screen().contains("scroll"), "{}", h.screen());
+    assert!(h.screen().contains("(↑↓ scroll)"), "{}", h.screen());
 }

@@ -183,9 +183,17 @@ fn reads_the_real_zap_stanzas_and_cask_dependencies() {
             );
         }
         for entry in &package.zap {
-            // Unrecognised directives are kept as written, never dropped.
+            // Unrecognised directives are kept as written, never dropped:
+            // `key: value`, naming the directive.
             if let ZapEntry::Other(raw) = entry {
                 eprintln!("{}: unrecognised zap entry {raw}", package.name);
+                assert!(
+                    raw.split_once(": ").is_some_and(|(key, value)| {
+                        !key.is_empty() && !key.contains(char::is_whitespace) && !value.is_empty()
+                    }),
+                    "{}: unrecognised zap entry not kept as `key: value`: {raw}",
+                    package.name
+                );
             }
         }
     }

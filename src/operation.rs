@@ -258,7 +258,7 @@ pub fn plan_removal(
     action: Action,
     targets: &[Target],
 ) -> Result<(Plan, Held), String> {
-    refuse_if_depended_on(system, package)?;
+    refuse_if_depended_on(system, package, action)?;
     let plan = Plan {
         targets: vec![removal(package, action)],
     };
@@ -266,15 +266,25 @@ pub fn plan_removal(
     Ok((plan, held))
 }
 
-/// Refuse to remove `package` if other installed Packages depend on it,
-/// naming them. A failed check refuses too, never counting as "none".
-fn refuse_if_depended_on(system: &impl System, package: &Package) -> Result<(), String> {
+/// Refuse to remove `package` (by `action`) if other installed Packages
+/// depend on it, naming them. A failed check refuses too, never counting as
+/// "none".
+fn refuse_if_depended_on(
+    system: &impl System,
+    package: &Package,
+    action: Action,
+) -> Result<(), String> {
     let dependents = dependents(system, package)?;
     if dependents.is_empty() {
         return Ok(());
     }
+    let verb = if action == Action::Zap {
+        "Zap"
+    } else {
+        "uninstall"
+    };
     Err(format!(
-        "Can't uninstall {}: other installed Packages depend on it: {}",
+        "Can't {verb} {}: other installed Packages depend on it: {}",
         package.name,
         dependents.join(", ")
     ))
@@ -483,8 +493,8 @@ pub fn graceful(
     };
 
     // Never quit anything for a removal that would be refused.
-    if let AfterQuit::Remove(_) = after
-        && let Err(error) = refuse_if_depended_on(system, package)
+    if let AfterQuit::Remove(removal) = &after
+        && let Err(error) = refuse_if_depended_on(system, package, removal.action)
     {
         let _ = events.send(Event::StepFinished {
             target: package.name.clone(),

@@ -117,9 +117,10 @@ fn app_paths(artifacts: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// A JSON value that may be one string or a list of them, as strings.
-/// Anything else is `Err` with the value as written.
-fn strings(value: &serde_json::Value) -> Vec<Result<String, String>> {
+/// The strings in a JSON value that may be one string or a list of them.
+/// An item that isn't a string comes back as `Err`, holding the item as
+/// written, so it can be shown rather than dropped.
+fn string_or_list(value: &serde_json::Value) -> Vec<Result<String, String>> {
     let one = |v: &serde_json::Value| v.as_str().map(String::from).ok_or_else(|| v.to_string());
     match value {
         serde_json::Value::Array(values) => values.iter().map(one).collect(),
@@ -131,15 +132,20 @@ fn strings(value: &serde_json::Value) -> Vec<Result<String, String>> {
 fn cask_dependencies(depends_on: &serde_json::Value) -> Vec<String> {
     depends_on
         .get("cask")
-        .map(|casks| strings(casks).into_iter().filter_map(Result::ok).collect())
+        .map(|casks| {
+            string_or_list(casks)
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// Every entry of a Cask's zap stanza: the directives brewmax knows, in a
 /// fixed order, then any others as written.
-fn zap(artifacts: &[serde_json::Value]) -> Vec<ZapEntry> {
-    type Make = fn(String) -> ZapEntry;
-    const KNOWN: [(&str, Make); 7] = [
+fn zap_entries(artifacts: &[serde_json::Value]) -> Vec<ZapEntry> {
+    type ToEntry = fn(String) -> ZapEntry;
+    const KNOWN: [(&str, ToEntry); 7] = [
         ("trash", ZapEntry::Remove),
         ("delete", ZapEntry::Remove),
         ("rmdir", ZapEntry::RemoveIfEmpty),
@@ -164,7 +170,7 @@ fn zap(artifacts: &[serde_json::Value]) -> Vec<ZapEntry> {
                 ("script", Some(executable)) => executable,
                 _ => value,
             };
-            for item in strings(value) {
+            for item in string_or_list(value) {
                 entries.push(match item {
                     Ok(text) => make(text),
                     Err(raw) => ZapEntry::Other(format!("{key}: {raw}")),
@@ -206,7 +212,7 @@ pub fn load_installed(system: &impl System) -> anyhow::Result<Vec<Package>> {
     let casks = info.casks.into_iter().map(|c| Package {
         version: c.installed.unwrap_or_default(),
         app_paths: app_paths(&c.artifacts),
-        zap: zap(&c.artifacts),
+        zap: zap_entries(&c.artifacts),
         cask_dependencies: cask_dependencies(&c.depends_on),
         pinned: c.pinned,
         self_updating: c.auto_updates.unwrap_or(false),

@@ -2,7 +2,7 @@
 //! world only through the [`System`] it is given.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -190,15 +190,36 @@ pub struct App<S: System + Clone + Send + 'static> {
     notice: Option<String>,
     /// How far the Zap confirmation's list can scroll, as last drawn.
     zap_view: Cell<ZapView>,
+    /// The user's home folder, to show Zap paths starting with `~`.
+    home: Option<String>,
 }
 
-/// The Zap confirmation's scrollable list, as last drawn: how far it can
-/// scroll and how many rows a page is.
+/// The Zap confirmation's scrollable list, as last drawn.
 #[derive(Debug, Clone, Copy, Default)]
 struct ZapView {
+    /// How far the list can scroll.
     max_scroll: u16,
+    /// How many rows of the list are visible.
     page: u16,
 }
+
+impl ZapView {
+    /// The scroll offset after pressing a scroll key, kept within the list.
+    fn scrolled(self, scroll: u16, key: KeyCode) -> u16 {
+        let page = self.page.max(1);
+        match key {
+            KeyCode::Down => scroll.saturating_add(1),
+            KeyCode::PageDown => scroll.saturating_add(page),
+            KeyCode::Up => scroll.saturating_sub(1),
+            KeyCode::PageUp => scroll.saturating_sub(page),
+            _ => scroll,
+        }
+        .min(self.max_scroll)
+    }
+}
+
+/// Said when a removal will Graceful Quit the Package's apps first.
+const GRACEFUL_FIRST: &str = "It is In Use: its apps get a Graceful Quit first.";
 
 impl<S: System + Clone + Send + 'static> App<S> {
     pub fn new(system: S) -> Self {
@@ -228,6 +249,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             search_input: None,
             notice: None,
             zap_view: Cell::new(ZapView::default()),
+            home: std::env::var("HOME").ok(),
         }
     }
 
@@ -235,6 +257,11 @@ impl<S: System + Clone + Send + 'static> App<S> {
     /// often it checks.
     pub fn set_quit_wait(&mut self, timeout: Duration, interval: Duration) {
         self.quit_wait = QuitWait { timeout, interval };
+    }
+
+    /// Change the home folder `~` paths are shown under.
+    pub fn set_home(&mut self, home: Option<String>) {
+        self.home = home;
     }
 
     pub fn should_quit(&self) -> bool {
@@ -489,6 +516,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             || operation.action.removes();
         operation.plan = Some(plan);
         if operation.action == Action::Zap {
+            self.zap_view.set(ZapView::default());
             operation.stage = Stage::ConfirmingZap {
                 typed: String::new(),
                 scroll: 0,
@@ -567,6 +595,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             targets: vec![operation::removal(package, action)],
         });
         if action == Action::Zap {
+            self.zap_view.set(ZapView::default());
             operation.stage = Stage::ConfirmingZap {
                 typed: String::new(),
                 scroll: 0,
@@ -820,23 +849,8 @@ impl<S: System + Clone + Send + 'static> App<S> {
                     typed.pop();
                 }
                 KeyCode::Char(c) => typed.push(c),
-                KeyCode::Down | KeyCode::PageDown => {
-                    let view = self.zap_view.get();
-                    let step = if key.code == KeyCode::Down {
-                        1
-                    } else {
-                        view.page
-                    };
-                    *scroll = scroll.saturating_add(step).min(view.max_scroll);
-                }
-                KeyCode::Up | KeyCode::PageUp => {
-                    let view = self.zap_view.get();
-                    let step = if key.code == KeyCode::Up {
-                        1
-                    } else {
-                        view.page
-                    };
-                    *scroll = scroll.saturating_sub(step);
+                KeyCode::Down | KeyCode::Up | KeyCode::PageDown | KeyCode::PageUp => {
+                    *scroll = self.zap_view.get().scrolled(*scroll, key.code);
                 }
                 _ => {}
             }
@@ -1111,9 +1125,14 @@ impl<S: System + Clone + Send + 'static> App<S> {
             render_operation(frame, log_area, operation);
             match &operation.stage {
                 Stage::Confirming => render_confirmation(frame, operation),
-                Stage::ConfirmingZap { typed, scroll } => {
-                    render_zap_confirmation(frame, operation, typed, *scroll, &self.zap_view)
-                }
+                Stage::ConfirmingZap { typed, scroll } => render_zap_confirmation(
+                    frame,
+                    operation,
+                    typed,
+                    *scroll,
+                    self.home.as_deref(),
+                    &self.zap_view,
+                ),
                 _ => {}
             }
         }
@@ -1504,9 +1523,7 @@ fn render_confirmation(frame: &mut Frame, operation: &Operation) {
             ));
         }
         if operation.graceful {
-            lines.push(Line::raw(
-                "It is In Use: its apps are asked to quit gracefully first.",
-            ));
+            lines.push(Line::raw(GRACEFUL_FIRST));
         }
         lines
     } else {
@@ -1558,6 +1575,7 @@ fn render_zap_confirmation(
     operation: &Operation,
     typed: &str,
     scroll: u16,
+    home: Option<&str>,
     view: &Cell<ZapView>,
 ) {
     let Some(package) = &operation.package else {
@@ -1568,13 +1586,10 @@ fn render_zap_confirmation(
         "Zap uninstalls {} and also does all of this:",
         package.name
     ))];
-    let home = std::env::var("HOME").ok();
-    lines.extend(zap_lines(&package.zap, home.as_deref()));
+    lines.extend(zap_lines(&package.zap, home));
     if operation.graceful {
         lines.push(Line::default());
-        lines.push(Line::raw(
-            "It is In Use: its apps are asked to quit gracefully first.",
-        ));
+        lines.push(Line::raw(GRACEFUL_FIRST));
     }
     let footer = Paragraph::new(vec![
         Line::default(),
@@ -1597,7 +1612,8 @@ fn render_zap_confirmation(
     let footer_rows = footer.line_count(inner_width) as u16;
     let list_rows = list.line_count(inner_width) as u16;
     let height = (list_rows + footer_rows + 2).min(area.height);
-    let list_height = height.saturating_sub(footer_rows + 2).max(1);
+    // The footer keeps its rows; the list gets whatever is left.
+    let list_height = height.saturating_sub(footer_rows + 2);
     let max_scroll = list_rows.saturating_sub(list_height);
     view.set(ZapView {
         max_scroll,
@@ -1611,7 +1627,7 @@ fn render_zap_confirmation(
         height,
     };
     let title = if max_scroll > 0 {
-        format!(" Confirm: {} (↑↓ PgUp PgDn scroll) ", operation.title)
+        format!(" Confirm: {} (↑↓ scroll) ", operation.title)
     } else {
         format!(" Confirm: {} ", operation.title)
     };
@@ -1625,51 +1641,79 @@ fn render_zap_confirmation(
     frame.render_widget(footer, footer_area);
 }
 
-/// A Zap's entries grouped under a heading per kind, paths with `~` shown
-/// under `home` and wildcard paths marked as patterns.
+/// The groups a Zap's entries are listed under, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ZapGroup {
+    Remove,
+    RemoveIfEmpty,
+    Service,
+    Receipt,
+    LoginItem,
+    Script,
+    Other,
+}
+
+impl ZapGroup {
+    /// The group an entry is listed under, its text, and whether that text
+    /// is a path.
+    fn of(entry: &ZapEntry) -> (ZapGroup, &String, bool) {
+        match entry {
+            ZapEntry::Remove(p) => (ZapGroup::Remove, p, true),
+            ZapEntry::RemoveIfEmpty(p) => (ZapGroup::RemoveIfEmpty, p, true),
+            ZapEntry::Service(s) => (ZapGroup::Service, s, false),
+            ZapEntry::Receipt(s) => (ZapGroup::Receipt, s, false),
+            ZapEntry::LoginItem(s) => (ZapGroup::LoginItem, s, false),
+            ZapEntry::Script(p) => (ZapGroup::Script, p, true),
+            ZapEntry::Other(s) => (ZapGroup::Other, s, false),
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            ZapGroup::Remove => "Deleted or moved to the Trash:",
+            ZapGroup::RemoveIfEmpty => "Removed if empty:",
+            ZapGroup::Service => "Background services unloaded:",
+            ZapGroup::Receipt => "Installer receipts forgotten:",
+            ZapGroup::LoginItem => "Login items removed:",
+            ZapGroup::Script => "Scripts run:",
+            ZapGroup::Other => "Other Zap steps (as the Cask writes them):",
+        }
+    }
+}
+
+/// How a Zap path is shown: a leading `~` as `home`, and a wildcard path
+/// marked as a pattern.
+fn shown_path(path: &str, home: Option<&str>) -> String {
+    let shown = match (path.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{home}{rest}")
+        }
+        _ => path.to_string(),
+    };
+    if path.contains(['*', '?', '[']) {
+        format!("{shown}  (pattern)")
+    } else {
+        shown
+    }
+}
+
+/// A Zap's entries grouped under a heading per kind.
 fn zap_lines(zap: &[ZapEntry], home: Option<&str>) -> Vec<Line<'static>> {
-    let path = |p: &str| {
-        let shown = match (p.strip_prefix('~'), home) {
-            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-                format!("{home}{rest}")
-            }
-            _ => p.to_string(),
-        };
-        if p.contains(['*', '?', '[']) {
-            format!("{shown}  (pattern)")
+    let mut groups: BTreeMap<ZapGroup, Vec<String>> = BTreeMap::new();
+    for entry in zap {
+        let (group, text, is_path) = ZapGroup::of(entry);
+        let text = if is_path {
+            shown_path(text, home)
         } else {
-            shown
-        }
-    };
-    const HEADINGS: [&str; 7] = [
-        "Deleted or moved to the Trash:",
-        "Removed if empty:",
-        "Background services unloaded:",
-        "Package receipts forgotten:",
-        "Login items removed:",
-        "Scripts run:",
-        "Other zap steps (as the Cask writes them):",
-    ];
-    // Each entry's group (an index into HEADINGS) and how it's shown.
-    let shown = |entry: &ZapEntry| match entry {
-        ZapEntry::Remove(p) => (0, path(p)),
-        ZapEntry::RemoveIfEmpty(p) => (1, path(p)),
-        ZapEntry::Service(s) => (2, s.clone()),
-        ZapEntry::Receipt(s) => (3, s.clone()),
-        ZapEntry::LoginItem(s) => (4, s.clone()),
-        ZapEntry::Script(p) => (5, path(p)),
-        ZapEntry::Other(s) => (6, s.clone()),
-    };
-    let entries: Vec<(usize, String)> = zap.iter().map(shown).collect();
+            text.clone()
+        };
+        groups.entry(group).or_default().push(text);
+    }
     let mut lines = Vec::new();
-    for (group, heading) in HEADINGS.iter().enumerate() {
-        let mut group_entries = entries.iter().filter(|(g, _)| *g == group).peekable();
-        if group_entries.peek().is_none() {
-            continue;
-        }
+    for (group, entries) in groups {
         lines.push(Line::default());
-        lines.push(Line::raw(*heading));
-        lines.extend(group_entries.map(|(_, text)| Line::raw(format!("  {text}"))));
+        lines.push(Line::raw(group.heading()));
+        lines.extend(entries.into_iter().map(|e| Line::raw(format!("  {e}"))));
     }
     lines
 }

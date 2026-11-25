@@ -176,7 +176,8 @@ pub struct Harness {
 
 impl Harness {
     pub fn start(system: FakeSystem) -> Self {
-        let app = App::new(system.clone());
+        let mut app = App::new(system.clone());
+        app.set_home(Some(HOME.to_string()));
         let terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let mut harness = Self {
             app,
@@ -274,7 +275,21 @@ impl Harness {
     }
 }
 
+/// The home folder the app is told about, so `~` paths show predictably.
+pub const HOME: &str = "/Users/tester";
+
 pub const INSTALLED_CMD: &str = "brew info --json=v2 --installed";
+
+/// `brew info --json=v2 --installed` output with no Formulae and one Cask,
+/// installed at 1.0, with `extra` JSON fields (e.g. `"depends_on": {…}`).
+pub fn one_cask_json(token: &str, extra: &str) -> String {
+    let extra = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(", {extra}")
+    };
+    format!(r#"{{"formulae": [], "casks": [{{"token": "{token}", "installed": "1.0"{extra}}}]}}"#)
+}
 
 /// Two Formulae and one Cask, in the shape `brew info --json=v2 --installed` emits.
 pub const INSTALLED_JSON: &str = r#"{
