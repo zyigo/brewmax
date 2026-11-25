@@ -36,6 +36,13 @@ jobs:
 
       - name: Package
         run: |
+          # Fail rather than publish a binary for the wrong architecture.
+          file target/release/brewmax | grep -q 'arm64' || {
+            echo "Expected an Apple silicon (arm64) binary:" >&2
+            file target/release/brewmax >&2
+            exit 1
+          }
+          # Must match the name scripts/update-tap.sh downloads.
           name="brewmax-$VERSION-aarch64-apple-darwin"
           mkdir -p dist
           ./target/release/brewmax --version
@@ -47,6 +54,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "brewmax $VERSION" \
-            --notes "Install with \`brew install zyigo/tap/brewmax\` (macOS, Apple silicon)."
+          # A re-run (after moving the tag) replaces the files of a release
+          # that was already published.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "brewmax $VERSION" \
+              --notes "Install with \`brew install zyigo/tap/brewmax\` (macOS, Apple silicon)."
+          fi

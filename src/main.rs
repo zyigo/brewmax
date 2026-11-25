@@ -8,8 +8,8 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 const USAGE: &str = "\
 Usage: brewmax [--version | --help]
 
-A terminal UI for managing Homebrew Packages without disrupting software
-that is In Use. Run with no arguments to start it; press ? inside for keys.
+A terminal UI for managing Homebrew Packages without disrupting the ones
+that are In Use. Run with no arguments to start it; press ? inside for keys.
 
 Options:
   -V, --version  Print the version and exit
@@ -20,6 +20,7 @@ fn main() -> anyhow::Result<()> {
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => {}
         ["-V" | "--version"] => {
+            // The Homebrew formula's test checks this exact output.
             println!("brewmax {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }

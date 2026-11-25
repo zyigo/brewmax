@@ -45,11 +45,12 @@ That formula lives in [zyigo/homebrew-tap](https://github.com/zyigo/homebrew-tap
    brew update
    brew upgrade zyigo/tap/brewmax   # or: brew install zyigo/tap/brewmax
    brew test zyigo/tap/brewmax
+   brew audit --strict --online zyigo/tap/brewmax
    ```
 
 ## If something goes wrong
 
-- **The workflow failed before publishing:** fix the problem, then move the tag to the fixed commit:
+- **The workflow failed:** fix the problem, then move the tag to the fixed commit. If it got as far as publishing, the re-run replaces the release's files:
 
   ```sh
   git tag -f v0.2.0
@@ -62,6 +63,8 @@ That formula lives in [zyigo/homebrew-tap](https://github.com/zyigo/homebrew-tap
   gh release delete v0.2.0 --cleanup-tag
   ```
 
-  Don't re-upload a different binary under the same version: the formula pins its SHA-256, and anyone who already installed it would get a checksum mismatch.
+  Until you release the patch version and run `scripts/update-tap.sh` for it, the tap's formula still points at the deleted download, so installs fail.
 
-brewmax can't update itself while it's running, so it Holds itself (see `GLOSSARY.md`). Quit it, then run `brew upgrade brewmax`.
+  Don't re-upload a different binary under a version the tap already points at: the formula pins its SHA-256, and installs would fail with a checksum mismatch.
+
+brewmax is always In Use while it runs, so it is Held and can't update itself (see `GLOSSARY.md`). Quit it, then run `brew upgrade zyigo/tap/brewmax`.

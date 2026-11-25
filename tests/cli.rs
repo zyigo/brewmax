@@ -22,7 +22,7 @@ fn version_prints_the_name_and_cargo_version() {
 }
 
 #[test]
-fn short_version_flag_works_too() {
+fn short_version_flag_prints_the_name_too() {
     let output = brewmax(&["-V"]);
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("brewmax "));

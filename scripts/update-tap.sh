@@ -12,6 +12,7 @@ version="${1:?usage: scripts/update-tap.sh <version, e.g. 0.1.0>}"
 version="${version#v}"
 repo="zyigo/brewmax"
 tap="zyigo/homebrew-tap"
+# Must match the name .github/workflows/release.yml publishes.
 asset="brewmax-$version-aarch64-apple-darwin.tar.gz"
 url="https://github.com/$repo/releases/download/v$version/$asset"
 
@@ -29,7 +30,7 @@ gh repo clone "$tap" "$work/tap" -- --quiet
 mkdir -p "$work/tap/Formula"
 cat > "$work/tap/Formula/brewmax.rb" <<FORMULA
 class Brewmax < Formula
-  desc "Terminal UI for Homebrew that won't change software you're using"
+  desc "Terminal UI for Homebrew that won't change Packages that are In Use"
   homepage "https://github.com/$repo"
   url "$url"
   sha256 "$sha256"
@@ -42,6 +43,7 @@ class Brewmax < Formula
   end
 
   test do
+    # Must match what \`brewmax --version\` prints (src/main.rs).
     assert_equal "brewmax #{version}", shell_output("#{bin}/brewmax --version").strip
   end
 end
