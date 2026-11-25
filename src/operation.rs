@@ -25,23 +25,45 @@ pub struct Step {
     pub to: String,
 }
 
-/// What updating one target changes: the target and the dependencies `brew`
-/// upgrades along with it.
+/// What an operation does to each target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Upgrade,
+    Install,
+}
+
+impl Action {
+    fn verb(self) -> &'static str {
+        match self {
+            Action::Upgrade => "upgrade",
+            Action::Install => "install",
+        }
+    }
+}
+
+/// What changing one target does: the target and the dependencies `brew`
+/// installs or upgrades along with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetPlan {
     pub target: String,
     pub kind: Kind,
+    pub action: Action,
     pub steps: Vec<Step>,
 }
 
 impl TargetPlan {
-    pub fn upgrade_command(&self) -> Command {
-        Command::brew(&["upgrade", kind_flag(self.kind), &self.target])
+    pub fn command(&self) -> Command {
+        Command::brew(&[self.action.verb(), kind_flag(self.kind), &self.target])
     }
 
-    /// The dry run of exactly the command [`TargetPlan::upgrade_command`] will run.
-    fn dry_run_command(target: &Package) -> Command {
-        Command::brew(&["upgrade", "--dry-run", kind_flag(target.kind), &target.name])
+    /// The dry run of exactly the command [`TargetPlan::command`] will run.
+    fn dry_run_command(action: Action, target: &Package) -> Command {
+        Command::brew(&[
+            action.verb(),
+            "--dry-run",
+            kind_flag(target.kind),
+            &target.name,
+        ])
     }
 }
 
@@ -111,6 +133,17 @@ pub fn plan(
     packages: &[Package],
     targets: &[Target],
 ) -> Result<(Plan, Held), String> {
+    plan_action(system, Action::Upgrade, packages, targets)
+}
+
+/// Like [`plan`], for any [`Action`]. Installing can upgrade installed
+/// dependencies too, so an install's Plan is checked for In Use the same way.
+pub fn plan_action(
+    system: &impl System,
+    action: Action,
+    packages: &[Package],
+    targets: &[Target],
+) -> Result<(Plan, Held), String> {
     let mut planned = Vec::new();
     for package in packages {
         if planned
@@ -119,7 +152,7 @@ pub fn plan(
         {
             continue;
         }
-        planned.push(plan_target(system, package)?);
+        planned.push(plan_target(system, action, package)?);
     }
     // Drop any target another target's upgrade brings along anyway, whatever
     // order they were planned in, so nothing is upgraded twice.
@@ -139,13 +172,18 @@ pub fn plan(
     Ok((plan, held))
 }
 
-fn plan_target(system: &impl System, target: &Package) -> Result<TargetPlan, String> {
+fn plan_target(
+    system: &impl System,
+    action: Action,
+    target: &Package,
+) -> Result<TargetPlan, String> {
     let output = system
-        .run(&TargetPlan::dry_run_command(target))
+        .run(&TargetPlan::dry_run_command(action, target))
         .map_err(|e| format!("{e:#}"))?;
     if !output.success {
         return Err(format!(
-            "brew could not plan the update of {}: {}",
+            "brew could not plan the {} of {}: {}",
+            action.verb(),
             target.name,
             output.stderr.trim()
         ));
@@ -156,7 +194,10 @@ fn plan_target(system: &impl System, target: &Package) -> Result<TargetPlan, Str
             0,
             Step {
                 name: target.name.clone(),
-                from: target.version.clone(),
+                from: match action {
+                    Action::Upgrade => target.version.clone(),
+                    Action::Install => String::new(),
+                },
                 to: String::new(),
             },
         );
@@ -164,6 +205,7 @@ fn plan_target(system: &impl System, target: &Package) -> Result<TargetPlan, Str
     Ok(TargetPlan {
         target: target.name.clone(),
         kind: target.kind,
+        action,
         steps,
     })
 }
@@ -195,8 +237,8 @@ pub fn execute(
             }
         }
 
-        let _ = events.send(Event::Line(format!("$ {}", target_plan.upgrade_command())));
-        let result = system.stream(&target_plan.upgrade_command(), &mut |line| {
+        let _ = events.send(Event::Line(format!("$ {}", target_plan.command())));
+        let result = system.stream(&target_plan.command(), &mut |line| {
             let _ = events.send(Event::Line(line.to_string()));
         });
         let (success, error) = match result {
@@ -229,21 +271,34 @@ fn held(system: &impl System, steps: Vec<&Step>, targets: &[Target]) -> Result<H
         .collect())
 }
 
-/// Every `name old -> new` line in `brew upgrade --dry-run` output.
+/// The Package changes in `brew upgrade --dry-run` or `brew install
+/// --dry-run` output: every `name old -> new` line (an upgrade), and every
+/// `name [version]` line under a `==> Would install` heading (a new install,
+/// with an empty `from`).
 fn parse_steps(output: &str) -> Vec<Step> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let mut words = line.split_whitespace();
-            let (name, from, arrow, to) =
-                (words.next()?, words.next()?, words.next()?, words.next()?);
-            (arrow == "->").then(|| Step {
-                name: name.into(),
-                from: from.into(),
-                to: to.into(),
-            })
-        })
-        .collect()
+    let mut steps = Vec::new();
+    let mut installing = false;
+    for line in output.lines() {
+        if let Some(heading) = line.strip_prefix("==>") {
+            installing = heading.trim_start().starts_with("Would install");
+            continue;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            [name, from, "->", to, ..] => steps.push(Step {
+                name: (*name).into(),
+                from: (*from).into(),
+                to: (*to).into(),
+            }),
+            [name, rest @ ..] if installing => steps.push(Step {
+                name: (*name).into(),
+                from: String::new(),
+                to: rest.first().map(|v| v.to_string()).unwrap_or_default(),
+            }),
+            _ => {}
+        }
+    }
+    steps
 }
 
 /// How long a Graceful Quit waits for an app to exit, and how often it checks.

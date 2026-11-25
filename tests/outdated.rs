@@ -177,8 +177,8 @@ fn pinned_packages_are_marked_in_both_tabs() {
     assert!(row(&h, "gh").contains("Pinned"), "{}", h.screen());
     assert!(!row(&h, "ffmpeg").contains("Pinned"));
 
-    h.press(KeyCode::Tab);
-    assert!(h.screen().contains("Installed"));
+    h.press_char('1');
+    assert!(h.screen().contains("┌ Installed"), "{}", h.screen());
     assert!(row(&h, "gh").contains("Pinned"), "{}", h.screen());
 }
 
@@ -315,4 +315,15 @@ fn question_mark_opens_and_closes_the_help_screen() {
     h.press_char('?');
     h.press(KeyCode::Esc);
     assert!(!h.screen().contains(" Help "), "{}", h.screen());
+}
+
+#[test]
+fn tab_cycles_through_installed_outdated_and_search() {
+    let mut h = Harness::start(machine());
+    h.press(KeyCode::Tab);
+    assert!(h.screen().contains("┌ Outdated"), "{}", h.screen());
+    h.press(KeyCode::Tab);
+    assert!(h.screen().contains("┌ Search"), "{}", h.screen());
+    h.press(KeyCode::Tab);
+    assert!(h.screen().contains("┌ Installed"), "{}", h.screen());
 }

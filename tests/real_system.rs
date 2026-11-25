@@ -130,3 +130,34 @@ fn finds_which_real_cask_apps_are_running() {
     }
     eprintln!("running Cask apps: {running:#?}");
 }
+
+#[test]
+#[ignore = "needs a real Homebrew installation; plans, never installs"]
+fn searches_the_real_catalog_and_plans_an_install_without_installing() {
+    let results = brewmax::search::search(&MacSystem, "ripgrep").expect("search should work");
+    let rga = results
+        .iter()
+        .find(|p| p.name == "ripgrep-all")
+        .expect("ripgrep-all should be found");
+    assert!(rga.desc.is_some() && !rga.version.is_empty(), "{rga:#?}");
+
+    let packages = inventory::load_installed(&MacSystem).expect("brew info should parse");
+    if packages.iter().any(|p| p.name == "ripgrep-all") {
+        return;
+    }
+    let targets: Vec<_> = packages.iter().map(brewmax::in_use::Target::from).collect();
+    let (plan, held) = brewmax::operation::plan_action(
+        &MacSystem,
+        brewmax::operation::Action::Install,
+        std::slice::from_ref(rga),
+        &targets,
+    )
+    .expect("install dry run should parse");
+    assert!(
+        plan.steps()
+            .iter()
+            .any(|s| s.name == "ripgrep-all" && s.from.is_empty()),
+        "{plan:#?}"
+    );
+    eprintln!("plan: {plan:#?}\nheld: {held:#?}");
+}

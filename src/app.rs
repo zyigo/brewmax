@@ -15,8 +15,9 @@ use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState, Tabs, Wr
 use crate::in_use::{self, InUse, Reason, Target};
 use crate::inventory::Kind;
 use crate::inventory::{self, Package};
-use crate::operation::{self, BREWMAX, Event, Held, Plan, QuitWait, TargetPlan};
+use crate::operation::{self, Action, BREWMAX, Event, Held, Plan, QuitWait, TargetPlan};
 use crate::outdated::{self, Refresh};
+use crate::search;
 use crate::system::System;
 
 /// How often the In Use scan repeats.
@@ -26,22 +27,25 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(3);
 enum Tab {
     Installed,
     Outdated,
+    Search,
 }
 
 impl Tab {
-    const ALL: [Tab; 2] = [Tab::Installed, Tab::Outdated];
+    const ALL: [Tab; 3] = [Tab::Installed, Tab::Outdated, Tab::Search];
 
     fn title(self) -> &'static str {
         match self {
             Tab::Installed => "Installed",
             Tab::Outdated => "Outdated",
+            Tab::Search => "Search",
         }
     }
 
     fn next(self) -> Tab {
         match self {
             Tab::Installed => Tab::Outdated,
-            Tab::Outdated => Tab::Installed,
+            Tab::Outdated => Tab::Search,
+            Tab::Search => Tab::Installed,
         }
     }
 }
@@ -119,9 +123,22 @@ impl Operation {
 }
 
 /// One row of the visible list: a group label or a Package (by index).
-enum Item {
+enum Item<'a> {
     Label(&'static str),
-    Package(usize),
+    Package(&'a Package),
+}
+
+/// A search of the Homebrew catalog.
+enum SearchState {
+    Idle,
+    Running {
+        query: String,
+        results: Receiver<Result<Vec<Package>, String>>,
+    },
+    Done {
+        query: String,
+        results: Result<Vec<Package>, String>,
+    },
 }
 
 pub struct App<S: System + Clone + Send + 'static> {
@@ -149,6 +166,9 @@ pub struct App<S: System + Clone + Send + 'static> {
     scan_in_flight: Option<Receiver<anyhow::Result<InUse>>>,
 
     operation: Option<Operation>,
+    search: SearchState,
+    /// The search query being typed, while the Search tab's input is open.
+    search_input: Option<String>,
     /// How long a Graceful Quit waits for an app to exit.
     quit_wait: QuitWait,
     /// Packages marked (with space) to update together.
@@ -181,6 +201,8 @@ impl<S: System + Clone + Send + 'static> App<S> {
             operation: None,
             marked: BTreeSet::new(),
             quit_wait: QuitWait::default(),
+            search: SearchState::Idle,
+            search_input: None,
             notice: None,
         }
     }
@@ -221,6 +243,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
     fn collect_background(&mut self, block: bool) {
         self.collect_scan(block);
         self.collect_refresh(block);
+        self.collect_search(block);
         // An operation can move straight on to its next stage (e.g. a
         // one-Package Plan starts running), so keep collecting until it
         // stops or waits for the user.
@@ -647,6 +670,22 @@ impl<S: System + Clone + Send + 'static> App<S> {
             }
             return;
         }
+        if let Some(query) = &mut self.search_input {
+            match key.code {
+                KeyCode::Esc => self.search_input = None,
+                KeyCode::Enter => {
+                    let query = std::mem::take(query);
+                    self.search_input = None;
+                    self.start_search(query);
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                }
+                KeyCode::Char(c) => query.push(c),
+                _ => {}
+            }
+            return;
+        }
         if self.help {
             if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
                 self.help = false;
@@ -680,7 +719,12 @@ impl<S: System + Clone + Send + 'static> App<S> {
             }
             KeyCode::Char('1') => self.switch_tab(Tab::Installed),
             KeyCode::Char('2') => self.switch_tab(Tab::Outdated),
+            KeyCode::Char('/') if self.tab == Tab::Search => {
+                self.search_input = Some(String::new());
+            }
             KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Char('3') => self.switch_tab(Tab::Search),
+            KeyCode::Char('i') if self.tab == Tab::Search => self.install(),
             KeyCode::Esc => {
                 self.filter.clear();
                 self.clamp_selection();
@@ -743,20 +787,25 @@ impl<S: System + Clone + Send + 'static> App<S> {
     }
 
     /// The rows of the current tab's list, after filtering.
-    fn items(&self) -> Vec<Item> {
-        let visible = |i: &usize| self.matches_filter(&self.packages[*i]);
-        let all = 0..self.packages.len();
+    fn items(&self) -> Vec<Item<'_>> {
+        let visible = |p: &&Package| self.matches_filter(p);
         match self.tab {
-            Tab::Installed => all.filter(visible).map(Item::Package).collect(),
+            Tab::Installed => self
+                .packages
+                .iter()
+                .filter(visible)
+                .map(Item::Package)
+                .collect(),
             Tab::Outdated => {
                 let Some(outdated) = self.outdated() else {
                     return Vec::new();
                 };
-                let is_outdated = |i: &usize| outdated.contains_key(&self.packages[*i].name);
-                let (self_updating, regular): (Vec<usize>, Vec<usize>) = all
-                    .filter(is_outdated)
+                let (self_updating, regular): (Vec<&Package>, Vec<&Package>) = self
+                    .packages
+                    .iter()
+                    .filter(|p| outdated.contains_key(&p.name))
                     .filter(visible)
-                    .partition(|i| self.packages[*i].self_updating);
+                    .partition(|p| p.self_updating);
                 let mut items: Vec<Item> = regular.into_iter().map(Item::Package).collect();
                 if !self_updating.is_empty() {
                     items.push(Item::Label("── Self-Updating"));
@@ -764,24 +813,90 @@ impl<S: System + Clone + Send + 'static> App<S> {
                 }
                 items
             }
+            Tab::Search => match &self.search {
+                SearchState::Done {
+                    results: Ok(results),
+                    ..
+                } => results.iter().map(Item::Package).collect(),
+                _ => Vec::new(),
+            },
         }
     }
 
-    /// Package indices of the selectable rows, in display order.
-    fn selectable(&self) -> Vec<usize> {
+    /// The selectable (Package) rows, in display order.
+    fn selectable(&self) -> Vec<&Package> {
         self.items()
             .into_iter()
             .filter_map(|item| match item {
-                Item::Package(i) => Some(i),
+                Item::Package(p) => Some(p),
                 Item::Label(_) => None,
             })
             .collect()
     }
 
     fn selected_package(&self) -> Option<&Package> {
-        self.selectable()
-            .get(self.selected)
-            .map(|i| &self.packages[*i])
+        self.selectable().get(self.selected).copied()
+    }
+
+    fn is_installed(&self, name: &str) -> bool {
+        self.packages.iter().any(|p| p.name == name)
+    }
+
+    // ---- search and install ----------------------------------------------
+
+    fn start_search(&mut self, query: String) {
+        if query.trim().is_empty() {
+            return;
+        }
+        let system = self.system.clone();
+        let (tx, rx) = mpsc::channel();
+        let q = query.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(search::search(&system, &q));
+        });
+        self.search = SearchState::Running { query, results: rx };
+        self.selected = 0;
+    }
+
+    fn collect_search(&mut self, block: bool) {
+        let SearchState::Running { query, results } = &self.search else {
+            return;
+        };
+        let Some(result) = receive(results, block) else {
+            return;
+        };
+        let results = result.unwrap_or_else(|()| Err("search stopped unexpectedly".to_string()));
+        self.search = SearchState::Done {
+            query: query.clone(),
+            results,
+        };
+        self.clamp_selection();
+    }
+
+    /// `i`: install the selected search result.
+    fn install(&mut self) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(package) = self.selected_package().cloned() else {
+            return;
+        };
+        let title = format!("Install {}", package.name);
+        if self.is_installed(&package.name) {
+            let message = format!("{} is already installed", package.name);
+            self.operation = Some(Operation::refused(title, message));
+            return;
+        }
+        let mut operation = Operation::new(title, Stage::Planning);
+        let system = self.system.clone();
+        let targets = self.targets();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let plan = operation::plan_action(&system, Action::Install, &[package], &targets);
+            let _ = tx.send(Event::Planned(plan));
+        });
+        operation.events = Some(rx);
+        self.operation = Some(operation);
     }
 
     // ---- rendering -------------------------------------------------------
@@ -818,7 +933,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let [tabs_area, status_area] =
-            Layout::horizontal([Constraint::Length(24), Constraint::Fill(1)]).areas(area);
+            Layout::horizontal([Constraint::Length(34), Constraint::Fill(1)]).areas(area);
         let selected = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
         let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()))
             .select(selected)
@@ -847,7 +962,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
         }
 
         let items = self.items();
-        let selected_package = self.selectable().get(self.selected).copied();
+        let selected_package = self.selected_package();
         let mut selected_row = None;
         let rows: Vec<Row> = items
             .iter()
@@ -855,11 +970,11 @@ impl<S: System + Clone + Send + 'static> App<S> {
             .map(|(row, item)| match item {
                 Item::Label(label) => Row::new(vec![label.to_string()])
                     .style(Style::new().add_modifier(Modifier::DIM)),
-                Item::Package(i) => {
-                    if Some(*i) == selected_package {
+                Item::Package(package) => {
+                    if selected_package.is_some_and(|s| std::ptr::eq(s, *package)) {
                         selected_row = Some(row);
                     }
-                    self.package_row(&self.packages[*i])
+                    self.package_row(package)
                 }
             })
             .collect();
@@ -884,6 +999,23 @@ impl<S: System + Clone + Send + 'static> App<S> {
         if let Some(error) = &self.load_error {
             return Some(format!("Could not read installed packages:\n{error}"));
         }
+        if self.tab == Tab::Search {
+            return match &self.search {
+                SearchState::Idle => {
+                    Some("Press / to search Homebrew for formulae and casks".to_string())
+                }
+                SearchState::Running { query, .. } => Some(format!("Searching for “{query}”…")),
+                SearchState::Done {
+                    results: Err(error),
+                    ..
+                } => Some(format!("Search failed:\n{error}")),
+                SearchState::Done {
+                    query,
+                    results: Ok(results),
+                } if results.is_empty() => Some(format!("No matches for “{query}”")),
+                SearchState::Done { .. } => None,
+            };
+        }
         if self.tab == Tab::Outdated {
             match &self.refresh {
                 RefreshState::NotStarted | RefreshState::Running(_) => {
@@ -906,6 +1038,9 @@ impl<S: System + Clone + Send + 'static> App<S> {
         }
         if package.pinned {
             tags.push("Pinned");
+        }
+        if self.tab == Tab::Search && self.is_installed(&package.name) {
+            tags.push("Installed");
         }
         let versions = match (self.tab, self.available(package)) {
             (Tab::Outdated, Some(available)) => format!("{} → {available}", package.version),
@@ -975,6 +1110,14 @@ impl<S: System + Clone + Send + 'static> App<S> {
         if let Some(notice) = &self.notice {
             return Paragraph::new(format!(" {notice}"));
         }
+        if let Some(query) = &self.search_input {
+            return Paragraph::new(format!(" Search: {query}▏  Enter search · Esc cancel"));
+        }
+        if self.tab == Tab::Search {
+            return Paragraph::new(
+                " ↑↓/jk move · Tab tab · / search · i install · ? help · q quit",
+            );
+        }
         if self.filtering {
             return Paragraph::new(format!(" Filter: {}▏  Enter keep · Esc clear", self.filter));
         }
@@ -992,7 +1135,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
 fn render_help(frame: &mut Frame) {
     let area = frame.area();
     let width = 60.min(area.width);
-    let height = 17.min(area.height);
+    let height = 18.min(area.height);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1001,12 +1144,13 @@ fn render_help(frame: &mut Frame) {
     };
     let lines = [
         ("↑ ↓  j k", "Move the selection"),
-        ("Tab  1 2", "Switch between Installed and Outdated"),
+        ("Tab 1 2 3", "Switch tabs: Installed, Outdated, Search"),
         ("space", "Mark or unmark the selected Package"),
         ("u", "Update the marked Packages, or the selected one"),
         ("U", "Update all (not Pinned or Self-Updating)"),
         ("g", "Quit an open app gracefully, update, reopen"),
-        ("/", "Filter the list by name"),
+        ("/", "Filter the list (on Search: search Homebrew)"),
+        ("i", "Install the selected search result"),
         ("Enter", "Keep the filter, back to the list"),
         ("Esc", "Clear the filter"),
         ("?", "Open or close this help"),
@@ -1143,11 +1287,10 @@ fn render_confirmation(frame: &mut Frame, operation: &Operation) {
         Line::raw(format!("This will change {} packages:", steps.len())),
         Line::default(),
     ];
-    lines.extend(
-        steps
-            .iter()
-            .map(|step| Line::raw(format!("  {:<20} {} → {}", step.name, step.from, step.to))),
-    );
+    lines.extend(steps.iter().map(|step| match step.from.as_str() {
+        "" => Line::raw(format!("  {:<20} new {}", step.name, step.to)),
+        from => Line::raw(format!("  {:<20} {from} → {}", step.name, step.to)),
+    }));
     if !operation.pre_held.is_empty() {
         lines.push(Line::default());
         lines.push(Line::raw("Held, will not change:"));
