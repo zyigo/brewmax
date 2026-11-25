@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,6 +20,16 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 pub struct FakeSystem {
     responses: Arc<Mutex<HashMap<String, Output>>>,
     commands: Arc<Mutex<Vec<String>>>,
+    holds: Arc<Mutex<HashMap<String, Receiver<()>>>>,
+}
+
+/// Lets a held command finish. Dropping it releases the command too.
+pub struct Release(Sender<()>);
+
+impl Release {
+    pub fn release(self) {
+        let _ = self.0.send(());
+    }
 }
 
 impl FakeSystem {
@@ -82,6 +93,17 @@ impl FakeSystem {
         self.responses.lock().unwrap().remove(command_line);
     }
 
+    /// Make the next run of a command line wait, mid-flight, until the
+    /// returned [`Release`] is released, e.g. to observe a slow `brew update`.
+    pub fn hold(&self, command_line: &str) -> Release {
+        let (tx, rx) = mpsc::channel();
+        self.holds
+            .lock()
+            .unwrap()
+            .insert(command_line.to_string(), rx);
+        Release(tx)
+    }
+
     /// How many times an exact command line has been sent.
     pub fn count(&self, command_line: &str) -> usize {
         self.commands()
@@ -100,6 +122,10 @@ impl System for FakeSystem {
     fn run(&self, command: &Command) -> anyhow::Result<Output> {
         let line = command.to_string();
         self.commands.lock().unwrap().push(line.clone());
+        let hold = self.holds.lock().unwrap().remove(&line);
+        if let Some(hold) = hold {
+            let _ = hold.recv();
+        }
         self.responses
             .lock()
             .unwrap()
@@ -119,7 +145,7 @@ pub struct Harness {
 impl Harness {
     pub fn start(system: FakeSystem) -> Self {
         let app = App::new(system.clone());
-        let terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let mut harness = Self {
             app,
             system,
@@ -134,12 +160,34 @@ impl Harness {
         self.render();
     }
 
-    /// Advance the app's clock to `now`, wait for any In Use scan that tick
-    /// started to finish, and re-render.
+    /// Advance the app's clock to `now`, wait for any background work that
+    /// tick started (In Use scan, refresh) to finish, and re-render.
     pub fn tick_at(&mut self, now: Instant) {
         self.app.tick(now);
-        self.app.wait_for_scan();
+        self.app.wait_for_background();
         self.render();
+    }
+
+    /// Advance the app's clock without waiting for background work.
+    pub fn tick_no_wait(&mut self, now: Instant) {
+        self.app.tick(now);
+        self.render();
+    }
+
+    /// Wait for all background work in flight, apply it and re-render.
+    pub fn settle(&mut self) {
+        self.app.wait_for_background();
+        self.render();
+    }
+
+    pub fn press_char(&mut self, c: char) {
+        self.press(KeyCode::Char(c));
+    }
+
+    pub fn type_text(&mut self, text: &str) {
+        for c in text.chars() {
+            self.press_char(c);
+        }
     }
 
     /// Run one In Use scan to completion.
@@ -160,8 +208,9 @@ impl Harness {
 
     fn detail_title_is(&self, name: &str) -> bool {
         // The detail pane's first content line is the selected Package's name.
-        self.screen()
-            .lines()
+        let screen = self.screen();
+        let mut lines = screen.lines().skip_while(|l| !l.contains(" Details "));
+        lines
             .nth(1)
             .and_then(|l| l.rsplit('│').nth(1))
             .is_some_and(|cell| cell.trim() == name)

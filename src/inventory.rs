@@ -27,6 +27,9 @@ pub struct Package {
     pub desc: Option<String>,
     /// For Casks: where their `.app` bundles are installed.
     pub app_paths: Vec<String>,
+    pub pinned: bool,
+    /// A Cask that updates itself, so brew only treats it as outdated when asked to.
+    pub self_updating: bool,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +46,8 @@ struct FormulaJson {
     desc: Option<String>,
     #[serde(default)]
     installed: Vec<InstalledJson>,
+    #[serde(default)]
+    pinned: bool,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +62,10 @@ struct CaskJson {
     installed: Option<String>,
     #[serde(default)]
     artifacts: Vec<serde_json::Value>,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    auto_updates: Option<bool>,
 }
 
 /// The installed locations of a Cask's `.app` bundles. Homebrew records the
@@ -99,10 +108,14 @@ pub fn load_installed(system: &impl System) -> anyhow::Result<Vec<Package>> {
         kind: Kind::Formula,
         desc: f.desc,
         app_paths: Vec::new(),
+        pinned: f.pinned,
+        self_updating: false,
     });
     let casks = info.casks.into_iter().map(|c| Package {
         version: c.installed.unwrap_or_default(),
         app_paths: app_paths(&c.artifacts),
+        pinned: c.pinned,
+        self_updating: c.auto_updates.unwrap_or(false),
         name: c.token,
         kind: Kind::Cask,
         desc: c.desc,

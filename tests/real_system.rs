@@ -44,3 +44,22 @@ fn scans_the_real_machine_for_in_use_packages() {
     }
     eprintln!("In Use on this machine: {in_use:#?}");
 }
+
+#[test]
+#[ignore = "needs a real Homebrew installation and network access"]
+fn refreshes_and_reads_the_real_outdated_packages() {
+    let packages = inventory::load_installed(&MacSystem).expect("brew info should parse");
+    let refresh = brewmax::outdated::refresh(&MacSystem);
+
+    let outdated = refresh.outdated.expect("brew outdated should parse");
+    for name in outdated.keys() {
+        assert!(
+            packages.iter().any(|p| &p.name == name),
+            "{name} is not an installed package"
+        );
+    }
+    eprintln!(
+        "update error: {:?}\noutdated: {outdated:#?}",
+        refresh.update_error
+    );
+}
