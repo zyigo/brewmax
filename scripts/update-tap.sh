@@ -33,7 +33,6 @@ class Brewmax < Formula
   homepage "https://github.com/$repo"
   url "$url"
   sha256 "$sha256"
-  version "$version"
 
   depends_on arch: :arm64
   depends_on :macos
