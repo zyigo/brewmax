@@ -27,6 +27,9 @@ pub struct Package {
     pub desc: Option<String>,
     /// For Casks: where their `.app` bundles are installed.
     pub app_paths: Vec<String>,
+    /// For Casks: the settings, caches and data a Zap removes, as the Cask
+    /// lists them (paths may start with `~` or contain wildcards).
+    pub zap_paths: Vec<String>,
     pub pinned: bool,
     /// A Cask that updates itself, so brew only treats it as outdated when asked to.
     pub self_updating: bool,
@@ -90,6 +93,30 @@ fn app_paths(artifacts: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+/// Everything a Cask's `zap` stanza trashes or deletes. Each of `trash`,
+/// `delete` and `rmdir` may be one path or a list.
+fn zap_paths(artifacts: &[serde_json::Value]) -> Vec<String> {
+    artifacts
+        .iter()
+        .filter_map(|artifact| artifact.get("zap")?.as_array())
+        .flatten()
+        .flat_map(|directive| {
+            ["trash", "delete", "rmdir"]
+                .into_iter()
+                .filter_map(|key| directive.get(key))
+                .flat_map(|paths| match paths {
+                    serde_json::Value::String(path) => vec![path.clone()],
+                    serde_json::Value::Array(paths) => paths
+                        .iter()
+                        .filter_map(|p| p.as_str().map(String::from))
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Read every installed Package, sorted by name.
 pub fn load_installed(system: &impl System) -> anyhow::Result<Vec<Package>> {
     let output = system.run(&Command::brew(&["info", "--json=v2", "--installed"]))?;
@@ -108,12 +135,14 @@ pub fn load_installed(system: &impl System) -> anyhow::Result<Vec<Package>> {
         kind: Kind::Formula,
         desc: f.desc,
         app_paths: Vec::new(),
+        zap_paths: Vec::new(),
         pinned: f.pinned,
         self_updating: false,
     });
     let casks = info.casks.into_iter().map(|c| Package {
         version: c.installed.unwrap_or_default(),
         app_paths: app_paths(&c.artifacts),
+        zap_paths: zap_paths(&c.artifacts),
         pinned: c.pinned,
         self_updating: c.auto_updates.unwrap_or(false),
         name: c.token,

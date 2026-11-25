@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState, Tabs, Wr
 use crate::in_use::{self, InUse, Reason, Target};
 use crate::inventory::Kind;
 use crate::inventory::{self, Package};
-use crate::operation::{self, Action, BREWMAX, Event, Held, Plan, QuitWait, TargetPlan};
+use crate::operation::{self, Action, AfterQuit, BREWMAX, Event, Held, Plan, QuitWait, TargetPlan};
 use crate::outdated::{self, Refresh};
 use crate::search;
 use crate::system::System;
@@ -61,8 +61,11 @@ enum RefreshState {
 enum Stage {
     /// Working out the Plan (dry runs and In Use check).
     Planning,
-    /// Waiting for the user to confirm a Plan with more than one Package.
+    /// Waiting for the user to confirm a Plan with more than one Package,
+    /// or any uninstall.
     Confirming,
+    /// Waiting for the user to type the Cask's name to confirm a Zap.
+    ConfirmingZap { typed: String, scroll: u16 },
     /// Running `brew`, target by target.
     Running,
     /// Left entirely unchanged because everything in the Plan is held.
@@ -87,6 +90,12 @@ struct Summary {
 struct Operation {
     /// What the operation is, e.g. "Update ffmpeg".
     title: String,
+    /// What it does to each target.
+    action: Action,
+    /// For a removal: the Package it removes.
+    package: Option<Package>,
+    /// Graceful Quit the Package's apps before running the Plan.
+    graceful: bool,
     /// The part of the Plan that will run.
     plan: Option<Plan>,
     /// Targets held already at planning, with what was In Use.
@@ -102,6 +111,9 @@ impl Operation {
     fn new(title: String, stage: Stage) -> Self {
         Operation {
             title,
+            action: Action::Upgrade,
+            package: None,
+            graceful: false,
             plan: None,
             pre_held: Vec::new(),
             stage,
@@ -400,7 +412,20 @@ impl<S: System + Clone + Send + 'static> App<S> {
         operation.summary.held = operation.pre_held.clone();
         let system = self.system.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || operation::execute(&system, &plan.targets, &targets, &tx));
+        match (&operation.package, operation.graceful, plan.targets.first()) {
+            (Some(package), true, Some(removal)) => {
+                let (package, removal, wait) = (package.clone(), removal.clone(), self.quit_wait);
+                std::thread::spawn(move || {
+                    let after = AfterQuit::Remove(removal);
+                    operation::graceful(&system, &package, &targets, wait, after, &tx);
+                });
+            }
+            _ => {
+                std::thread::spawn(move || {
+                    operation::execute(&system, &plan.targets, &targets, &tx);
+                });
+            }
+        }
         operation.stage = Stage::Running;
         operation.events = Some(rx);
     }
@@ -425,10 +450,15 @@ impl<S: System + Clone + Send + 'static> App<S> {
                 .collect();
             operation.pre_held.push((target.target, target_held));
         }
+        let then = if operation.action.removes() {
+            "uninstall"
+        } else {
+            "update"
+        };
         for (target, held) in &operation.pre_held {
             if open_app(held, target) {
                 operation.log.push(format!(
-                    "{target} is open: select it and press g to quit it gracefully and update"
+                    "{target} is open: select it and press g to quit it gracefully and {then}"
                 ));
             }
         }
@@ -442,9 +472,16 @@ impl<S: System + Clone + Send + 'static> App<S> {
             return;
         }
         let plan = Plan { targets: runnable };
-        let needs_confirmation = plan.needs_confirmation() || !operation.pre_held.is_empty();
+        let needs_confirmation = plan.needs_confirmation()
+            || !operation.pre_held.is_empty()
+            || operation.action.removes();
         operation.plan = Some(plan);
-        if needs_confirmation {
+        if operation.action == Action::Zap {
+            operation.stage = Stage::ConfirmingZap {
+                typed: String::new(),
+                scroll: 0,
+            };
+        } else if needs_confirmation {
             operation.stage = Stage::Confirming;
         } else {
             self.execute();
@@ -460,6 +497,9 @@ impl<S: System + Clone + Send + 'static> App<S> {
         let Some(package) = self.selected_package().cloned() else {
             return;
         };
+        if self.graceful_removal(&package) {
+            return;
+        }
         let app_open = self
             .in_use
             .get(&package.name)
@@ -478,6 +518,96 @@ impl<S: System + Clone + Send + 'static> App<S> {
             operation::graceful_update(&system, &package, &targets, wait, &tx);
         });
         let mut operation = Operation::new(title, Stage::Running);
+        operation.events = Some(rx);
+        self.operation = Some(operation);
+    }
+
+    /// `g` after uninstalling (or zapping) `package` was Held because its app
+    /// is open: ask to confirm quitting the app gracefully and uninstalling.
+    /// Returns whether it did.
+    fn graceful_removal(&mut self, package: &Package) -> bool {
+        let Some(operation) = &self.operation else {
+            return false;
+        };
+        let Stage::Held(held) = &operation.stage else {
+            return false;
+        };
+        if !operation.action.removes()
+            || operation.package.as_ref().map(|p| &p.name) != Some(&package.name)
+            || !open_app(held, &package.name)
+        {
+            return false;
+        }
+        let action = operation.action;
+        let verb = if action == Action::Zap {
+            "zap"
+        } else {
+            "uninstall"
+        };
+        let mut operation = Operation::new(
+            format!("Quit and {verb} {}", package.name),
+            Stage::Confirming,
+        );
+        operation.action = action;
+        operation.package = Some(package.clone());
+        operation.graceful = true;
+        operation.plan = Some(Plan {
+            targets: vec![operation::removal(package, action)],
+        });
+        if action == Action::Zap {
+            operation.stage = Stage::ConfirmingZap {
+                typed: String::new(),
+                scroll: 0,
+            };
+        }
+        self.operation = Some(operation);
+        true
+    }
+
+    /// `x` (or `Z` for a Zap): uninstall the selected Package, never the
+    /// marked ones. Always confirmed; Held if In Use; refused if other
+    /// Packages depend on it.
+    fn uninstall(&mut self, action: Action) {
+        if self.refuse_if_busy() {
+            return;
+        }
+        let Some(selected) = self.selected_package() else {
+            return;
+        };
+        let name = selected.name.clone();
+        let verb = if action == Action::Zap {
+            "Zap"
+        } else {
+            "Uninstall"
+        };
+        let title = format!("{verb} {name}");
+        // Search results lack what an installed Package knows (its apps).
+        let Some(package) = self.packages.iter().find(|p| p.name == name).cloned() else {
+            let message = format!("{name} is not installed");
+            self.operation = Some(Operation::refused(title, message));
+            return;
+        };
+        if action == Action::Zap && package.kind != Kind::Cask {
+            let message = format!("Zap is only for Casks; press x to uninstall {name}");
+            self.operation = Some(Operation::refused(title, message));
+            return;
+        }
+        if action == Action::Zap && package.zap_paths.is_empty() {
+            let message =
+                format!("{name} lists no settings or data to Zap; press x to uninstall it");
+            self.operation = Some(Operation::refused(title, message));
+            return;
+        }
+        let mut operation = Operation::new(title, Stage::Planning);
+        operation.action = action;
+        operation.package = Some(package.clone());
+        let system = self.system.clone();
+        let targets = self.targets();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let plan = operation::plan_removal(&system, &package, action, &targets);
+            let _ = tx.send(Event::Planned(plan));
+        });
         operation.events = Some(rx);
         self.operation = Some(operation);
     }
@@ -659,6 +789,32 @@ impl<S: System + Clone + Send + 'static> App<S> {
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.notice = None;
         if let Some(Operation {
+            stage: Stage::ConfirmingZap { typed, scroll },
+            package,
+            ..
+        }) = &mut self.operation
+        {
+            match key.code {
+                KeyCode::Esc => self.confirm(false),
+                KeyCode::Enter => {
+                    if package.as_ref().is_some_and(|p| p.name == *typed) {
+                        self.confirm(true);
+                    } else {
+                        self.notice =
+                            Some("Type the Cask's name exactly to Zap it, or Esc to cancel".into());
+                    }
+                }
+                KeyCode::Backspace => {
+                    typed.pop();
+                }
+                KeyCode::Char(c) => typed.push(c),
+                KeyCode::Down => *scroll = scroll.saturating_add(1),
+                KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(Operation {
             stage: Stage::Confirming,
             ..
         }) = &self.operation
@@ -733,6 +889,8 @@ impl<S: System + Clone + Send + 'static> App<S> {
             KeyCode::Char('u') => self.update(),
             KeyCode::Char('U') => self.update_all(),
             KeyCode::Char('g') => self.graceful_quit(),
+            KeyCode::Char('x') => self.uninstall(Action::Uninstall),
+            KeyCode::Char('Z') => self.uninstall(Action::Zap),
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('q') => match &self.operation {
                 Some(operation) if operation.busy() => {
@@ -888,6 +1046,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             return;
         }
         let mut operation = Operation::new(title, Stage::Planning);
+        operation.action = Action::Install;
         let system = self.system.clone();
         let targets = self.targets();
         let (tx, rx) = mpsc::channel();
@@ -922,8 +1081,12 @@ impl<S: System + Clone + Send + 'static> App<S> {
         frame.render_widget(self.footer(), footer_area);
         if let Some(operation) = &self.operation {
             render_operation(frame, log_area, operation);
-            if matches!(operation.stage, Stage::Confirming) {
-                render_confirmation(frame, operation);
+            match &operation.stage {
+                Stage::Confirming => render_confirmation(frame, operation),
+                Stage::ConfirmingZap { typed, scroll } => {
+                    render_zap_confirmation(frame, operation, typed, *scroll)
+                }
+                _ => {}
             }
         }
         if self.help {
@@ -1127,7 +1290,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
             format!("  [filter: {}]", self.filter)
         };
         Paragraph::new(format!(
-            " ↑↓/jk move · Tab tab · space mark · u update · U all · g quit & update · / filter · ? help · q quit{filter}"
+            " ↑↓/jk move · Tab tab · space mark · u update · U all · g quit & update · x uninstall · / filter · ? help · q quit{filter}"
         ))
     }
 }
@@ -1135,7 +1298,7 @@ impl<S: System + Clone + Send + 'static> App<S> {
 fn render_help(frame: &mut Frame) {
     let area = frame.area();
     let width = 60.min(area.width);
-    let height = 18.min(area.height);
+    let height = 20.min(area.height);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1149,6 +1312,8 @@ fn render_help(frame: &mut Frame) {
         ("u", "Update the marked Packages, or the selected one"),
         ("U", "Update all (not Pinned or Self-Updating)"),
         ("g", "Quit an open app gracefully, update, reopen"),
+        ("x", "Uninstall the selected Package"),
+        ("Z", "Zap: uninstall a Cask and delete its data"),
         ("/", "Filter the list (on Search: search Homebrew)"),
         ("i", "Install the selected search result"),
         ("Enter", "Keep the filter, back to the list"),
@@ -1217,10 +1382,12 @@ fn summarise(reasons: &[Reason]) -> Vec<String> {
 fn render_operation(frame: &mut Frame, area: Rect, operation: &Operation) {
     let status = match &operation.stage {
         Stage::Planning => vec!["Working out what would change…".to_string()],
-        Stage::Confirming => vec!["Waiting for confirmation".to_string()],
+        Stage::Confirming | Stage::ConfirmingZap { .. } => {
+            vec!["Waiting for confirmation".to_string()]
+        }
         Stage::Running => vec!["Running…".to_string()],
-        Stage::Held(held) => vec![held_message(held)],
-        Stage::Finished(summary) => summary_lines(&operation.title, summary),
+        Stage::Held(held) => vec![held_message(operation.action, held)],
+        Stage::Finished(summary) => summary_lines(operation, summary),
         Stage::Done { ok: true, message } => vec![format!("✔ {message}")],
         Stage::Done { ok: false, message } => vec![format!("✘ {message}")],
     };
@@ -1242,13 +1409,17 @@ fn render_operation(frame: &mut Frame, area: Rect, operation: &Operation) {
 }
 
 /// What happened in a run, one line per outcome.
-fn summary_lines(title: &str, summary: &Summary) -> Vec<String> {
+fn summary_lines(operation: &Operation, summary: &Summary) -> Vec<String> {
     if summary.held.is_empty() && summary.failed.is_empty() {
-        return vec![format!("✔ {title}: done")];
+        return vec![format!("✔ {}: done", operation.title)];
     }
     let mut lines = Vec::new();
     if !summary.updated.is_empty() {
-        lines.push(format!("✔ Updated: {}", summary.updated.join(", ")));
+        lines.push(format!(
+            "✔ {}: {}",
+            operation.action.done(),
+            summary.updated.join(", ")
+        ));
     }
     for (target, held) in &summary.held {
         lines.push(format!("⏸ Held: {target} ({})", in_use_description(held)));
@@ -1270,10 +1441,14 @@ fn in_use_description(held: &Held) -> String {
         .join("; ")
 }
 
-fn held_message(held: &Held) -> String {
+fn held_message(action: Action, held: &Held) -> String {
     if held.iter().any(|(name, _)| name == BREWMAX) {
-        return "Held: brewmax can't update itself while running. Quit and run `brew upgrade brewmax`."
-            .to_string();
+        return if action.removes() {
+            "Held: brewmax can't uninstall itself while running. Quit and run `brew uninstall brewmax`."
+        } else {
+            "Held: brewmax can't update itself while running. Quit and run `brew upgrade brewmax`."
+        }
+        .to_string();
     }
     format!("Held, nothing was changed: {}", in_use_description(held))
 }
@@ -1283,14 +1458,38 @@ fn render_confirmation(frame: &mut Frame, operation: &Operation) {
         return;
     };
     let steps = plan.steps();
-    let mut lines = vec![
-        Line::raw(format!("This will change {} packages:", steps.len())),
-        Line::default(),
-    ];
-    lines.extend(steps.iter().map(|step| match step.from.as_str() {
-        "" => Line::raw(format!("  {:<20} new {}", step.name, step.to)),
-        from => Line::raw(format!("  {:<20} {from} → {}", step.name, step.to)),
-    }));
+    let mut lines = if operation.action.removes() {
+        let mut lines = vec![Line::raw("This will uninstall:"), Line::default()];
+        lines.extend(
+            steps
+                .iter()
+                .map(|step| Line::raw(format!("  {:<20} {}", step.name, step.from))),
+        );
+        if operation
+            .package
+            .as_ref()
+            .is_some_and(|p| p.kind == Kind::Cask)
+        {
+            lines.push(Line::default());
+            lines.push(Line::raw(
+                "Its settings and data are kept (Z zaps them instead).",
+            ));
+        }
+        if operation.graceful {
+            lines.push(Line::raw("Its open apps are asked to quit first."));
+        }
+        lines
+    } else {
+        let mut lines = vec![
+            Line::raw(format!("This will change {} packages:", steps.len())),
+            Line::default(),
+        ];
+        lines.extend(steps.iter().map(|step| match step.from.as_str() {
+            "" => Line::raw(format!("  {:<20} new {}", step.name, step.to)),
+            from => Line::raw(format!("  {:<20} {from} → {}", step.name, step.to)),
+        }));
+        lines
+    };
     if !operation.pre_held.is_empty() {
         lines.push(Line::default());
         lines.push(Line::raw("Held, will not change:"));
@@ -1318,6 +1517,67 @@ fn render_confirmation(frame: &mut Frame, operation: &Operation) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(format!(" Confirm: {} ", operation.title))),
+        popup,
+    );
+}
+
+/// The Zap confirmation: every path the Zap removes, scrollable when they
+/// don't fit, confirmed only by typing the Cask's name.
+fn render_zap_confirmation(frame: &mut Frame, operation: &Operation, typed: &str, scroll: u16) {
+    let Some(package) = &operation.package else {
+        return;
+    };
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut lines = vec![
+        Line::raw(format!(
+            "Zap uninstalls {} and deletes these settings, caches and data:",
+            package.name
+        )),
+        Line::default(),
+    ];
+    lines.extend(
+        package
+            .zap_paths
+            .iter()
+            .map(|path| Line::raw(format!("  {path}"))),
+    );
+    if operation.graceful {
+        lines.push(Line::default());
+        lines.push(Line::raw("Its open apps are asked to quit first."));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled("This cannot be undone.", bold));
+    lines.push(Line::styled(
+        format!(
+            "Type {} and press Enter to Zap, Esc to cancel: {typed}▏",
+            package.name
+        ),
+        bold,
+    ));
+    let area = frame.area();
+    let width = 100.min(area.width);
+    let inner = width.saturating_sub(2).max(1) as usize;
+    // Rows once wrapped, so a long list scrolls instead of being cut off.
+    let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(inner)).sum();
+    let height = (rows as u16 + 2).min(area.height);
+    let max_scroll = (rows as u16 + 2).saturating_sub(height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let title = if max_scroll > 0 {
+        format!(" Confirm: {} (↑↓ scroll) ", operation.title)
+    } else {
+        format!(" Confirm: {} ", operation.title)
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(max_scroll), 0))
+            .block(Block::bordered().title(title)),
         popup,
     );
 }

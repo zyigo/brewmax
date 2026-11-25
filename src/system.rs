@@ -10,10 +10,13 @@ use std::sync::mpsc;
 /// - automatic cleanup off, so old versions a running process may still use
 ///   are only removed by brewmax's Cleanup (ADR 0001);
 /// - automatic `brew update` off, so an upgrade does exactly what its dry-run
-///   Plan said (brewmax refreshes on launch instead).
-pub const BREW_ENV: [(&str, &str); 2] = [
+///   Plan said (brewmax refreshes on launch instead);
+/// - automatic removal of unneeded dependencies off, so an uninstall removes
+///   exactly the Package confirmed (unneeded dependencies are Cleanup's job).
+pub const BREW_ENV: [(&str, &str); 3] = [
     ("HOMEBREW_NO_INSTALL_CLEANUP", "1"),
     ("HOMEBREW_NO_AUTO_UPDATE", "1"),
+    ("HOMEBREW_NO_AUTOREMOVE", "1"),
 ];
 
 /// A command to run: a program, its arguments and extra environment.

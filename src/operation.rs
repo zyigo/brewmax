@@ -30,6 +30,10 @@ pub struct Step {
 pub enum Action {
     Upgrade,
     Install,
+    /// Remove the Package, leaving a Cask's settings and data alone.
+    Uninstall,
+    /// Remove a Cask together with its settings, caches and data.
+    Zap,
 }
 
 impl Action {
@@ -37,6 +41,22 @@ impl Action {
         match self {
             Action::Upgrade => "upgrade",
             Action::Install => "install",
+            Action::Uninstall | Action::Zap => "uninstall",
+        }
+    }
+
+    /// Whether this Action removes Packages.
+    pub fn removes(self) -> bool {
+        matches!(self, Action::Uninstall | Action::Zap)
+    }
+
+    /// What a target the Action succeeded on has become, e.g. "Updated".
+    pub fn done(self) -> &'static str {
+        match self {
+            Action::Upgrade => "Updated",
+            Action::Install => "Installed",
+            Action::Uninstall => "Uninstalled",
+            Action::Zap => "Zapped",
         }
     }
 }
@@ -53,7 +73,11 @@ pub struct TargetPlan {
 
 impl TargetPlan {
     pub fn command(&self) -> Command {
-        Command::brew(&[self.action.verb(), kind_flag(self.kind), &self.target])
+        let kind = kind_flag(self.kind);
+        match self.action {
+            Action::Zap => Command::brew(&["uninstall", "--zap", kind, &self.target]),
+            action => Command::brew(&[action.verb(), kind, &self.target]),
+        }
     }
 
     /// The dry run of exactly the command [`TargetPlan::command`] will run.
@@ -195,7 +219,7 @@ fn plan_target(
             Step {
                 name: target.name.clone(),
                 from: match action {
-                    Action::Upgrade => target.version.clone(),
+                    Action::Upgrade | Action::Uninstall | Action::Zap => target.version.clone(),
                     Action::Install => String::new(),
                 },
                 to: String::new(),
@@ -210,15 +234,81 @@ fn plan_target(
     })
 }
 
+/// The Plan for uninstalling (or, with [`Action::Zap`], zapping) one
+/// installed Package: just the Package itself.
+pub fn removal(package: &Package, action: Action) -> TargetPlan {
+    TargetPlan {
+        target: package.name.clone(),
+        kind: package.kind,
+        action,
+        steps: vec![Step {
+            name: package.name.clone(),
+            from: package.version.clone(),
+            to: String::new(),
+        }],
+    }
+}
+
+/// Work out the Plan for uninstalling (or zapping) `package`, and whether it
+/// is In Use. Refused if other installed Packages depend on it; a failed
+/// dependents check is refused too, never treated as "no dependents".
+pub fn plan_removal(
+    system: &impl System,
+    package: &Package,
+    action: Action,
+    targets: &[Target],
+) -> Result<(Plan, Held), String> {
+    let dependents = dependents(system, package)?;
+    if !dependents.is_empty() {
+        return Err(format!(
+            "Can't uninstall {}: other installed Packages depend on it: {}",
+            package.name,
+            dependents.join(", ")
+        ));
+    }
+    let plan = Plan {
+        targets: vec![removal(package, action)],
+    };
+    let held = held(system, plan.steps(), targets)?;
+    Ok((plan, held))
+}
+
+/// The installed Packages that depend on `package`. `brew uses` only knows
+/// Formula dependencies, so a Cask has none it can report.
+fn dependents(system: &impl System, package: &Package) -> Result<Vec<String>, String> {
+    if package.kind == Kind::Cask {
+        return Ok(Vec::new());
+    }
+    let output = system
+        .run(&Command::brew(&["uses", "--installed", &package.name]))
+        .map_err(|e| format!("Could not check what depends on {}: {e:#}", package.name))?;
+    if !output.success {
+        return Err(format!(
+            "Could not check what depends on {}: {}",
+            package.name,
+            output.stderr.trim()
+        ));
+    }
+    Ok(output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
 /// Run each target's part of a Plan in turn: check In Use just before it,
 /// upgrade it, and carry on whatever happened. Then re-read the installed
-/// Packages. Progress is sent as [`Event`]s.
+/// Packages. Progress is sent as [`Event`]s. Returns the targets `brew`
+/// succeeded on.
 pub fn execute(
     system: &impl System,
     plan: &[TargetPlan],
     targets: &[Target],
     events: &Sender<Event>,
-) {
+) -> Vec<String> {
+    let mut succeeded = Vec::new();
     for target_plan in plan {
         let target = target_plan.target.clone();
         match held(system, target_plan.steps.iter().collect(), targets) {
@@ -245,6 +335,9 @@ pub fn execute(
             Ok(success) => (success, None),
             Err(e) => (false, Some(format!("{e:#}"))),
         };
+        if success && error.is_none() {
+            succeeded.push(target.clone());
+        }
         let _ = events.send(Event::StepFinished {
             target,
             success,
@@ -256,6 +349,7 @@ pub fn execute(
         packages: inventory::load_installed(system).map_err(|e| format!("{e:#}")),
         outdated: outdated::load_outdated(system).map_err(|e| format!("{e:#}")),
     });
+    succeeded
 }
 
 /// The Packages among `steps` that are In Use now.
@@ -318,15 +412,38 @@ impl Default for QuitWait {
     }
 }
 
-/// Graceful Quit: ask each of the Cask's running apps to quit the normal way
-/// (so it can prompt to save), wait until it has exited, update the Cask as
-/// usual, then reopen the apps brewmax quit. Never force-kills: if an app
-/// refuses or doesn't exit in time, the Cask stays Held and unchanged.
+/// What a Graceful Quit goes on to do once the Cask's apps have quit.
+#[derive(Debug, Clone)]
+pub enum AfterQuit {
+    /// Update the Cask, then reopen the apps.
+    Update,
+    /// Run this (confirmed) removal; reopen the apps only if the Cask is
+    /// still installed afterwards.
+    Remove(TargetPlan),
+}
+
+/// Graceful Quit, then update the Cask as usual and reopen the apps brewmax
+/// quit.
 pub fn graceful_update(
     system: &impl System,
     package: &Package,
     targets: &[Target],
     wait: QuitWait,
+    events: &Sender<Event>,
+) {
+    graceful(system, package, targets, wait, AfterQuit::Update, events);
+}
+
+/// Graceful Quit: ask each of the Cask's running apps to quit the normal way
+/// (so it can prompt to save), wait until it has exited, then do `after`.
+/// Never force-kills: if an app refuses or doesn't exit in time, the Cask
+/// stays Held and unchanged.
+pub fn graceful(
+    system: &impl System,
+    package: &Package,
+    targets: &[Target],
+    wait: QuitWait,
+    after: AfterQuit,
     events: &Sender<Event>,
 ) {
     let line = |text: String| {
@@ -421,18 +538,31 @@ pub fn graceful_update(
         std::thread::sleep(wait.interval);
     }
 
-    match plan(system, std::slice::from_ref(package), targets) {
-        Err(error) => {
-            let _ = events.send(Event::StepFinished {
-                target: package.name.clone(),
-                success: false,
-                error: Some(error),
-            });
+    match after {
+        AfterQuit::Update => {
+            match plan(system, std::slice::from_ref(package), targets) {
+                Err(error) => {
+                    let _ = events.send(Event::StepFinished {
+                        target: package.name.clone(),
+                        success: false,
+                        error: Some(error),
+                    });
+                }
+                Ok((_, held)) if !held.is_empty() => hold(held),
+                Ok((plan, _)) => {
+                    execute(system, &plan.targets, targets, events);
+                }
+            }
+            reopen(system, &quit, &line);
         }
-        Ok((_, held)) if !held.is_empty() => hold(held),
-        Ok((plan, _)) => execute(system, &plan.targets, targets, events),
+        AfterQuit::Remove(removal) => {
+            let removed = execute(system, std::slice::from_ref(&removal), targets, events);
+            if !removed.contains(&package.name) {
+                // Still installed: leave nothing closed.
+                reopen(system, &quit, &line);
+            }
+        }
     }
-    reopen(system, &quit, &line);
 }
 
 /// Reopen apps brewmax quit.

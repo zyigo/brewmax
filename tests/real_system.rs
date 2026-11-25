@@ -161,3 +161,20 @@ fn searches_the_real_catalog_and_plans_an_install_without_installing() {
     );
     eprintln!("plan: {plan:#?}\nheld: {held:#?}");
 }
+
+#[test]
+#[ignore = "needs a real Homebrew installation"]
+fn reads_the_real_zap_paths_of_installed_casks() {
+    let packages = inventory::load_installed(&MacSystem).expect("brew info should parse");
+    for package in packages.iter().filter(|p| p.kind == Kind::Cask) {
+        for path in &package.zap_paths {
+            assert!(!path.is_empty(), "{} has an empty zap path", package.name);
+        }
+    }
+    assert!(
+        packages
+            .iter()
+            .all(|p| p.kind == Kind::Cask || p.zap_paths.is_empty()),
+        "only Casks have zap paths"
+    );
+}
